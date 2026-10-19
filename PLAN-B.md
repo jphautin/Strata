@@ -134,8 +134,20 @@ Findings (Oct 2026, this PC):
   pass through shared host RAM. No link join, no symbol clash, no toolchain mix. Each is a normal single-backend
   build. Cost: the hand-off itself is small (a few hundred KB per window, already pinned today). The costs that
   matter are the cross-card chunk overlap, the shared expert arena, and the pipeline. See §7 and RISKS.md R9.
-- Rule: land B.2 first. It reuses two normal builds and needs no link surgery. Reconsider B.1 only if you need
-  one process. Vulkan (Track A) stays the slower last resort.
+- Rule (Oct 2026, after the rebase): land B.1 on `trackB1-one-binary`. The hard part already ships in the tree:
+  `strata_kq` is a shared library of kernels that runs in the host's context on the host's stream, with an ABI
+  check (`strata_kq_abi()` `mmq_kq_lib.cu:33`, `strata_kq_init(device)` `:38`, `strata_kq_run(device, type, args,
+  stream)` `:46`), opened by `LoadLibraryA`/`dlopen` (`mmq_kq_loader.cpp:62`/`:64`, symbols by name `:71-73`).
+  A `dlopen` join also means there is NO link-time mixing of clang and cl objects at all, so the confirmed CMake
+  guard (`Windows-Clang.cmake:187`) is side-stepped, not fought. And B.1 is the only design that keeps the
+  overlapped hand-off as upstream wrote it: one process owns both cards' memory, so `wait_flag_ge` stays inside
+  the graph, with no IPC and no extra H2D per window (§7).
+- Keep B.2 on `trackB2-two-processes` as the fallback. Use it if a HIP kernel library loaded into a CUDA-alive
+  process misbehaves, or if carrying the HIP runtime next to CUDA is refused. It gives up the in-graph flag wait
+  and must re-implement the cross-process guards: the overlap, the arena cut by layer range, the pipeline
+  rollback, the CPU set, and the dead-peer guard (§7, RISKS.md R9).
+- Vulkan (Track A) on `trackA-vulkan` stays the slower last resort: it loses tensor cores, nvfp4 and dp4a
+  (RISKS.md R1).
 
 ## 7. What B.2 costs in speed (grounded, Oct 2026)
 

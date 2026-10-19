@@ -40,6 +40,7 @@ lists only one brand's devices (`src/core/device.cu:78` `device_count()`).
 | October 2026 | One branch per solution: `trackA-vulkan`, `trackB1-one-binary`, `trackB2-two-processes`. | `main` can stay equal to upstream, so each solution has its own line, and the next resync stays trivial. |
 | October 2026 | Re-derive the seam at 0.1.45. Do not re-apply the patch. | Upstream changed `CMakeLists.txt` (+217), `cmake/hip_backend.cmake` (+11) and `device.hpp` (+8). Anchors: PLAN-B.md §8. |
 | October 2026 | B.2 must keep the overlapped hand-off. | Upstream measured the overlap at 53 -> 70.1 tok/s on 2x gfx1100 (+32%). The serial form is about a third of decode. |
+| October 2026 | Recommend B.1 (`trackB1-one-binary`); keep B.2 as the fallback. | The `dlopen` join side-steps the CMake guard with the in-tree `strata_kq` pattern, and only B.1 keeps `wait_flag_ge` inside the graph (no IPC, no extra H2D per window). |
 
 ## 5. Track B — two variants
 
