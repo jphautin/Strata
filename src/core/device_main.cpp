@@ -27,16 +27,19 @@ int main(int argc, char** argv) {
     bool selftest = false;
     bool list_devices = false;
     bool list_runtimes = false;
+    bool probe_cross = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
         else if (std::strcmp(argv[i], "--list-runtimes") == 0) list_runtimes = true;
+        else if (std::strcmp(argv[i], "--probe-cross") == 0) probe_cross = true;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("usage: strata-device [--selftest] [--list-devices]\n"
                         "  --list-devices  every GPU the runtime enumerates, numbered as HIP_VISIBLE_DEVICES /\n"
                         "                  CUDA_VISIBLE_DEVICES number them, and whether this binary can run it\n");
 #ifdef STRATA_MULTI_BRAND
-            std::printf("  --list-runtimes every GPU this process can drive, both brands, numbered cuda:N / hip:N\n");
+            std::printf("  --list-runtimes every GPU this process can drive, both brands, numbered cuda:N / hip:N\n"
+                        "  --probe-cross  run one AMD kernel from the library in THIS process (its CUDA is up)\n");
 #endif
             return 0;
         } else {
@@ -96,6 +99,21 @@ int main(int argc, char** argv) {
         return 0;
 #else
         std::fprintf(stderr, "strata-device: --list-runtimes needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
+        return 2;
+#endif
+    }
+
+    // The gate for the NEXT step (routing the AMD layers through the library): one AMD kernel has to run in
+    // THIS process, whose CUDA runtime is already up and is still holding VRAM.  Prints each card's free VRAM
+    // before, during and after, so "free" cannot mean "nothing was ever allocated".
+    if (probe_cross) {
+#ifdef STRATA_MULTI_BRAND
+        const bool ran = strata::core::cross_runtime_probe();
+        std::printf("cross-runtime probe: %s\n", ran ? "the AMD kernel ran and wrote what it read back"
+                                                    : "the AMD kernel did NOT run - do not route AMD layers here");
+        return ran ? 0 : 3;
+#else
+        std::fprintf(stderr, "strata-device: --probe-cross needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
         return 2;
 #endif
     }

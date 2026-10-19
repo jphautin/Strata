@@ -84,13 +84,25 @@ int device_count();
 // the runtime cannot describe it.
 bool device_summary(int ordinal, std::string& name, std::string& detail);
 
-// The cards ONE process can drive, in ONE list: this build's own runtime first (upstream's order), then the
-// AMD cards that strata_hip_kernels lists from INSIDE its own runtime.  A CUDA process cannot ask HIP for
-// them - amdhip64 answers with an empty list once CUDA owns the process - so the answer comes from the
-// library that carries the HIP runtime (src/hip/kernels_probe.cu), opened by
-// src/core/hip_kernels_loader.cpp.  `hip_kernels_ready()` says whether that library is in this process.
+// The cards ONE process can drive, in ONE list, in the EXISTING order: this build's own runtime first
+// (upstream's order), then the AMD cards that strata_hip_kernels lists from inside its own runtime.  Nothing
+// here re-ranks them: a CUDA process cannot ask HIP for its cards (amdhip64 answers with an empty list once
+// CUDA owns the process), so the AMD part comes from the library that carries the HIP runtime
+// (src/hip/kernels_probe.cu), opened by src/core/hip_kernels_loader.cpp.
+//
+// Which card is the MAIN one (the layers then go: main card, second card, then the CPU tier - the expert pool
+// in RAM) is the user's choice, asked at setup and saved in the run config: setup.py asks and writes the
+// order into "gpu", and writes "gpu_order": "as_given" when the answer is not the recommended order, so
+// serve/server.py's ordered_gpus() keeps it.  That is upstream's own key, with upstream's measured default
+// (the faster card LAST for an auto split, #1352; skipped when it would end on less VRAM, #1576) still in
+// force when the user did not choose.  There is no cross-brand power table here: a CUDA card and an RDNA
+// card share no power unit, so this seam does not invent a ranking - it keeps the ids and their order stable.
 std::vector<DeviceInfo> union_device_list();
 bool hip_kernels_ready();
+
+// The measurement that gates routing the AMD layers here: run one AMD kernel from the library in THIS process,
+// whose CUDA runtime is already up and is still holding VRAM, and print each card's free VRAM around it.
+bool cross_runtime_probe();
 
 // STRATA_PRIMARY_DEVICE (generate.cpp): the ordinal the engine's own session runs on; 0 = the runtime's first
 // visible device (upstream's behavior).  The Windows HIP runtime enumerates the cards in a fixed order no

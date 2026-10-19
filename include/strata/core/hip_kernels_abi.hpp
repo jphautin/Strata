@@ -32,10 +32,20 @@ struct StrataHipDevices {
     } d[8];
 };
 
+// One AMD kernel run by this library, plus the card's free VRAM before and after.  This is the measurement
+// that gates the NEXT step (the AMD layers' real kernels): an AMD code object has to load and run in a
+// process whose CUDA runtime is already up, and its card's memory has to stay this runtime's own.
+struct StrataHipTouch {
+    unsigned long long free_before = 0, free_after = 0;
+    int kernel_ok = 0;        // 1 = the launch, the sync and the read-back all returned
+    int sample_is_nan = 0;    // 1 = the first float read back IS a NaN, so the kernel wrote it
+};
+
 extern "C" {
 typedef int (*strata_hip_kernels_abi_fn)();
 typedef int (*strata_hip_kernels_init_fn)(int device);
 typedef int (*strata_hip_kernels_probe_fn)(void* out);  // out IS a StrataHipDevices*
+typedef int (*strata_hip_kernels_touch_fn)(int device, void* out);  // out IS a StrataHipTouch*
 }
 
 // The device id of a mixed rig ("cuda:0", "hip:1", or a plain ordinal) lives with the device facts in

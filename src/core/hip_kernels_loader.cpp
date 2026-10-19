@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,8 @@ struct Hip {
     int n = 0;
     StrataHipDevices devices{};
     std::string path;
+    void* h = nullptr;                                // the open library, for the entry points used later
+    strata_hip_kernels_touch_fn touch = nullptr;      // one AMD kernel + this card's free VRAM, measured
 };
 
 Hip open_hip_lib() {
@@ -83,14 +86,18 @@ Hip open_hip_lib() {
     const auto abi = (strata_hip_kernels_abi_fn) sym(h, "strata_hip_kernels_abi");
     const auto init = (strata_hip_kernels_init_fn) sym(h, "strata_hip_kernels_init");
     const auto probe = (strata_hip_kernels_probe_fn) sym(h, "strata_hip_kernels_probe");
+    const auto touch = (strata_hip_kernels_touch_fn) sym(h, "strata_hip_kernels_touch");
     const int a = abi ? abi() : 0;
-    if (init == nullptr || probe == nullptr || a / 100000 != STRATA_HIP_KERNELS_ABI_VERSION ||
-        a % 100000 != (int) sizeof(StrataHipDevices)) {
-        std::fprintf(stderr, "strata: %s is from another engine version, or its probe block is another size: "
-                             "this process sees its own brand only\n",
+    if (init == nullptr || probe == nullptr || touch == nullptr ||
+        a / 1000000 != STRATA_HIP_KERNELS_ABI_VERSION ||
+        (a / 100) % 10000 != (int) sizeof(StrataHipDevices) || a % 100 != (int) sizeof(StrataHipTouch)) {
+        std::fprintf(stderr, "strata: %s is from another engine version, or its argument blocks are another "
+                             "size: this process sees its own brand only\n",
                      L.path.c_str());
         return L;
     }
+    L.h = h;
+    L.touch = touch;
     L.n = probe(&L.devices);
     if (L.n <= 0) {
         std::fprintf(stderr, "strata: %s sees no AMD device: this process keeps its own brand only\n",
@@ -128,6 +135,61 @@ const Hip& hip_lib() {
 }  // namespace
 
 bool hip_kernels_ready() { return hip_lib().ok; }
+
+// BOTH cards in ONE process, measured.  This gates the NEXT step (the AMD layers' real kernels route through
+// this library): a code object that loads but cannot run, or an AMD card whose memory HIP can claim while
+// CUDA still holds its own, would make that step pointless.  Prints what it measured; true = the AMD kernel
+// ran and wrote the value it read back.
+bool cross_runtime_probe() {
+    const Hip& L = hip_lib();
+    if (!L.ok) {
+        std::fprintf(stderr, "strata: the cross-runtime probe needs strata_hip_kernels next to the engine\n");
+        return false;
+    }
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    auto own_free = [GiB](int ordinal) {
+        try {
+            const DeviceInfo i = device_info(ordinal);
+            return (double) i.free_bytes / GiB;
+        } catch (const CudaError&) {
+            return -1.0;  // this build cannot run that card; the reason is reported by the listing
+        }
+    };
+
+    // Hold VRAM on this build's own card the whole time, so a "free VRAM unchanged" line cannot be bought by
+    // nothing being allocated at all.
+    std::unique_ptr<DeviceArena> hold;
+    const double f0 = own_free(0);
+    try {
+        hold = std::make_unique<DeviceArena>(256ull << 20, 0, false);  // one cudaMalloc of 256 MiB
+    } catch (const CudaError& e) {
+        std::fprintf(stderr, "strata: could not hold VRAM on GPU 0 (%s)\n", e.what());
+    }
+    const double f1 = own_free(0);
+    std::printf("cuda:0 free %.3f -> %.3f GiB while this engine holds %s (%s)\n", f0, f1,
+                hold ? "256 MiB" : "nothing",
+                hold ? "one cudaMalloc" : "the hold failed");
+
+    bool hip_ran = false;
+    for (int d = 0; d < L.n; ++d) {
+        StrataHipTouch t{};
+        const int e = L.touch(d, &t);
+        std::printf("hip:%d touch error %d, kernel %d, read-back NaN %d, free %.3f -> %.3f GiB (total %.3f, "
+                    "wave %d)\n",
+                    d, e, t.kernel_ok, t.sample_is_nan, (double) t.free_before / GiB,
+                    (double) t.free_after / GiB, (double) L.devices.d[d].total_bytes / GiB,
+                    (int) L.devices.d[d].wave);
+        if (t.kernel_ok == 1 && t.sample_is_nan == 1) hip_ran = true;
+    }
+
+    const double f2 = own_free(0);
+    std::printf("cuda:0 free after the AMD kernel: %.3f GiB (was %.3f while held)\n", f2, f1);
+    std::fflush(stdout);
+    std::fprintf(stderr, "strata: cross-runtime probe: the AMD kernel %s in a process whose CUDA is already up "
+                         "and holds %s\n",
+                 hip_ran ? "RAN" : "did NOT run", hold ? "256 MiB" : "nothing");
+    return hip_ran;
+}
 
 // ONE process, both brands: this build's own runtime first (upstream's numbering), then the AMD cards the
 // library listed from INSIDE its own runtime.  `device_info` tags each of its own cards with the runtime it
