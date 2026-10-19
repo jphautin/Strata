@@ -100,6 +100,20 @@ endif()
 if(STRATA_ENABLE_CUDA AND STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
   message(FATAL_ERROR "STRATA_ENABLE_CUDA and STRATA_ENABLE_HIP are separate backends; enable only one")
 endif()
+# B.1 (Track B): ONE process that drives both brands at native speed.  The NVIDIA half is compiled by nvcc in
+# this build; the AMD half arrives as strata_hip_kernels, a shared library built by the HIP build and opened at
+# run time by the engine (src/core/hip_kernels_loader.cpp opens src/hip/kernels_probe.cu, the shape
+# src/prefill/mmq_kq_loader.cpp ships).  It stays a TWO-build join here: CMake's Windows-Clang-HIP module
+# raises "mixes Clang and MSVC ... not supported" when HIP (clang) and this engine's MSVC host share one
+# configure, so no option can put both toolchains in one configure - a dlopen join never links them either.
+# Default OFF: every existing build keeps exactly its own sources and flags.
+option(STRATA_MULTI_BRAND "Open the AMD kernels library built by the HIP build, so one process sees both brands (CUDA engine + strata_hip_kernels)" OFF)
+if(STRATA_MULTI_BRAND AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP)
+  message(FATAL_ERROR "STRATA_MULTI_BRAND needs a GPU backend: the CUDA engine build, or the HIP build that produces strata_hip_kernels")
+endif()
+if(STRATA_MULTI_BRAND)
+  add_compile_definitions(STRATA_MULTI_BRAND=1)
+endif()
 if(STRATA_ENABLE_HIP)
   include(cmake/hip_backend.cmake)
 endif()
@@ -324,6 +338,25 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
   target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target})
+  if(STRATA_MULTI_BRAND)
+    # the engine half of B.1's join.  Built in both backends: the CUDA engine build opens the AMD library the
+    # HIP build produced (the mixed rig), and a HIP build keeps its own cards and says why.  Without the
+    # library next to it, nothing changes (see the loader).
+    target_sources(strata_core PRIVATE src/core/hip_kernels_loader.cpp)
+    if(NOT WIN32)
+      target_link_libraries(strata_core PUBLIC ${CMAKE_DL_LIBS})
+    endif()
+  endif()
+  if(STRATA_MULTI_BRAND AND STRATA_ENABLE_HIP)
+    # the AMD half of B.1's join: built here (ROCm's clang + HIP), opened there (MSVC + CUDA).  Its entry table
+    # is extern "C" with a version and size check, so neither toolchain sees the other's objects or headers -
+    # the same shape strata_kq uses below for the K-quant MMQ instances.
+    add_library(strata_hip_kernels SHARED src/hip/kernels_probe.cu)
+    target_include_directories(strata_hip_kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(strata_hip_kernels PRIVATE strata_hip_runtime)
+    set_target_properties(strata_hip_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    message(STATUS "Strata: STRATA_MULTI_BRAND=ON here produced strata_hip_kernels; put it next to the CUDA engine to list and run both brands in one process")
+  endif()
 
   add_executable(strata-device src/core/device_main.cpp)
   target_link_libraries(strata-device PRIVATE strata_core)

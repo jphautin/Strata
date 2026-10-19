@@ -26,13 +26,18 @@ static std::string human(uint64_t b) {
 int main(int argc, char** argv) {
     bool selftest = false;
     bool list_devices = false;
+    bool list_runtimes = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
+        else if (std::strcmp(argv[i], "--list-runtimes") == 0) list_runtimes = true;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("usage: strata-device [--selftest] [--list-devices]\n"
                         "  --list-devices  every GPU the runtime enumerates, numbered as HIP_VISIBLE_DEVICES /\n"
                         "                  CUDA_VISIBLE_DEVICES number them, and whether this binary can run it\n");
+#ifdef STRATA_MULTI_BRAND
+            std::printf("  --list-runtimes every GPU this process can drive, both brands, numbered cuda:N / hip:N\n");
+#endif
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -60,6 +65,39 @@ int main(int argc, char** argv) {
                 std::printf("  cannot run: %s\n", why.c_str());
         }
         return 0;
+    }
+
+    // Both brands in ONE process (Track B, B.1's shape): the cards this engine's own runtime enumerates, then
+    // the AMD cards strata_hip_kernels listed from INSIDE its own runtime - which is the narrow blocker today:
+    // one runtime names only one brand's devices, so docs/MULTI_GPU.md:53 refuses a mix of NVIDIA and AMD.
+    // The layer split itself needs neither NVLink nor peer-to-peer access (its hand-off goes through pinned
+    // host RAM), so a list that carries the brand is what a mixed rig needs.  Format:
+    //   cuda:0: <name>
+    //     compute capability 8.6, 8.0 GiB
+    //   hip:0: <name>
+    //     arch gfx1201, 15.9 GiB
+    if (list_runtimes) {
+#ifdef STRATA_MULTI_BRAND
+        for (const strata::core::DeviceInfo& d : strata::core::union_device_list()) {
+            const bool hip = d.runtime == strata::core::DeviceRuntime::HIP;
+            std::printf("%s%d: %s\n", hip ? "hip" : "cuda", d.ordinal, d.name.c_str());
+            if (hip)
+                std::printf("  arch %s, %s\n", d.arch.c_str(), human(d.total_bytes).c_str());
+            else
+                std::printf("  compute capability %d.%d, %s\n", d.cc_major, d.cc_minor,
+                            human(d.total_bytes).c_str());
+        }
+#ifdef STRATA_USE_HIP
+        std::printf("AMD kernels library: not applicable (this engine is the HIP side; the CUDA engine build opens it)\n");
+#else
+        std::printf("AMD kernels library: %s\n",
+                    strata::core::hip_kernels_ready() ? "present" : "not present next to this engine");
+#endif
+        return 0;
+#else
+        std::fprintf(stderr, "strata-device: --list-runtimes needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
+        return 2;
+#endif
     }
 
     try {

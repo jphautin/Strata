@@ -270,6 +270,13 @@ DeviceInfo device_info(int ordinal) {
     }
     DeviceInfo d;
     d.ordinal = ordinal;
+    // Which runtime this card is on.  Upstream runs one runtime and never needed it; a mixed rig (Track B)
+    // places a stage on a card of a chosen brand, so each card has to say which brand it belongs to.
+#if defined(STRATA_USE_HIP)
+    d.runtime = DeviceRuntime::HIP;
+#else
+    d.runtime = DeviceRuntime::CUDA;
+#endif
     check(cudaSetDevice(ordinal), "cudaSetDevice");
 
     cudaDeviceProp p{};

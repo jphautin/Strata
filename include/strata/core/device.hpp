@@ -18,8 +18,44 @@
 
 namespace strata::core {
 
+// Which runtime a device belongs to.  Upstream runs ONE runtime, so it sees ONE brand and a plain ordinal in
+// --gpus is enough; OWN keeps that meaning.  CUDA and HIP name a brand, which is what a mixed rig needs:
+// "--gpus cuda:0,hip:0" (docs/MULTI_GPU.md:53 still refuses a mix of NVIDIA and AMD cards today).  Track B
+// keeps each card's native kernels, so a stage must know the runtime of the card it runs on.
+enum class DeviceRuntime { OWN, CUDA, HIP };
+
+// A device id on a mixed rig: "cuda:0" (NVIDIA), "hip:1" (AMD), or a plain ordinal ("2" = this engine's own
+// runtime, upstream's behavior).  false when the text is not a device id; the out-params then keep what they had.
+inline bool parse_device_id(const std::string& text, DeviceRuntime& runtime, int& ordinal) {
+    auto digits = [](const std::string& s, size_t from, int& out) {
+        if (from >= s.size()) return false;
+        int v = 0, seen = 0;
+        for (size_t i = from; i < s.size(); ++i) {
+            if (s[i] < '0' || s[i] > '9') return false;
+            v = v * 10 + (s[i] - '0');
+            ++seen;
+        }
+        if (seen == 0) return false;
+        out = v;
+        return true;
+    };
+    auto ci = [](const std::string& s, size_t at, const char* word) {
+        for (size_t i = 0; word[i]; ++i) {
+            if (at + i >= s.size()) return false;
+            const char c = s[at + i] >= 'A' && s[at + i] <= 'Z' ? char(s[at + i] - 'A' + 'a') : s[at + i];
+            if (c != word[i]) return false;
+        }
+        return true;
+    };
+    if (text.empty()) return false;
+    if (ci(text, 0, "cuda:") && digits(text, 5, ordinal)) { runtime = DeviceRuntime::CUDA; return true; }
+    if (ci(text, 0, "hip:") && digits(text, 4, ordinal)) { runtime = DeviceRuntime::HIP; return true; }
+    return digits(text, 0, ordinal) ? (runtime = DeviceRuntime::OWN, true) : false;
+}
+
 struct DeviceInfo {
     int ordinal = -1;
+    DeviceRuntime runtime = DeviceRuntime::CUDA;   // set by src/core/device.cu: which runtime this card is on
     std::string name;
     int cc_major = 0, cc_minor = 0;
     uint64_t total_bytes = 0;      // as reported by cudaMemGetInfo at query time
@@ -47,6 +83,14 @@ int device_count();
 // "arch gfx1201, 15.9 GiB" (HIP) or "compute capability 12.0, 11.9 GiB" (CUDA), plus the device's name.  false when
 // the runtime cannot describe it.
 bool device_summary(int ordinal, std::string& name, std::string& detail);
+
+// The cards ONE process can drive, in ONE list: this build's own runtime first (upstream's order), then the
+// AMD cards that strata_hip_kernels lists from INSIDE its own runtime.  A CUDA process cannot ask HIP for
+// them - amdhip64 answers with an empty list once CUDA owns the process - so the answer comes from the
+// library that carries the HIP runtime (src/hip/kernels_probe.cu), opened by
+// src/core/hip_kernels_loader.cpp.  `hip_kernels_ready()` says whether that library is in this process.
+std::vector<DeviceInfo> union_device_list();
+bool hip_kernels_ready();
 
 // STRATA_PRIMARY_DEVICE (generate.cpp): the ordinal the engine's own session runs on; 0 = the runtime's first
 // visible device (upstream's behavior).  The Windows HIP runtime enumerates the cards in a fixed order no
