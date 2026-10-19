@@ -67,6 +67,14 @@ The server checks it before the start and says what is wrong (0.1.39, #644).
 
 **Card order with `"auto"`** (NVIDIA, #1352): the faster card (multiprocessors x max clock) goes **last** - the last stage runs the head, the draft layer and the verify, and a prompt chunk waits on it (a 4070 Ti SUPER + 5060 Ti read a 6K prompt in 50 s one way round and 15 s the other). Cards whose scores are within 5% of each other (two of the same model) keep your order; a manual split keeps it too. `"gpu_order": "as_given"` keeps the order you wrote under `"auto"` as well. The engine log line `layer split: card order ...` says when it changed.
 
+**The main card, asked at setup (0.1.45).** Setup asks a second question when your model is shared: which card is
+the MAIN one. Its layers come first and it holds the largest share of the model; the next card holds the rest of
+the layers; the experts no card holds stay in RAM. Option 1 is the recommended card (the newest generation, then
+the most VRAM). Naming another one writes `"gpu_order": "as_given"` into the config, so every start keeps the
+order you chose and the card order above is not applied. Naming "1" leaves that default alone. Setup never picks
+the main card by power: no unit is shared by an NVIDIA card and an AMD card, so which card is "more powerful" is
+yours to say, once, at setup.
+
 **An unequal pair under `"auto"` (#2644).** The search prices a decode window, and it can give almost every layer to the card it
 rates faster. A card with one or two layers holds a handful of experts and clamps the prompt chunk of the whole pipeline
 (#1616), so the search then asks for at least 3 layers per card - which on a 4060 Ti 16 GB + 3060 12 GB (48 layers, IQ3_S)

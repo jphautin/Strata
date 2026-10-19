@@ -1070,6 +1070,8 @@ def pcie_lines(link: dict) -> tuple[str, str | None]:
 
 
 GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
+GPU_ORDER_GIVEN = False                                 # choose_gpus: the user named the main card, so the config
+                                                        # keeps that card order (see ask_gpu_order, "gpu_order")
 SPLIT_MIN_VRAM_GB = 8                                   # a card sharing a model holds the dense weights and its own
                                                         # prompt buffers too (docs/MULTI_GPU.md)
 SPLIT_PROMPT_VRAM_GB = 12                               # #448: a split stage lends a prompt chunk's buffers from its
@@ -1293,9 +1295,35 @@ def start_gpus(text):
     return parse_gpus(text, found)
 
 
+def ask_gpu_order(a, cards) -> list:
+    """Which card is the MAIN one, asked when the model is shared across cards: its layers come first and it holds
+    the largest share; the other cards hold the rest of the layers; what no card holds stays in RAM (the expert
+    tier).  "1" is the recommended card (gpu_rank: the newest generation, then the most VRAM).  Answering another
+    card saves that order in the run config ("gpu_order": "as_given", which serve/server.py's ordered_gpus keeps);
+    answering "1" leaves the measured default alone (the FASTER card last, #1352, not when that would end the
+    split on less VRAM, #1576): there is no power unit shared by an NVIDIA card and an AMD card, so which card is
+    "more powerful" is never guessed here - the user says so, once, at setup.  Returns the card numbers, main first."""
+    if len(cards) < 2:
+        return [g["index"] for g in cards]
+    say()
+    say("  Which card is the MAIN one?  Its layers come first, it holds the largest share of the model, and prompts")
+    say("  start on it.  The other cards hold the rest of the layers; the experts no card holds stay in RAM.")
+    for i, g in enumerate(cards, 1):
+        say(f"  {i}) {gpu_name(g)}" + ("   (recommended)" if i == 1 else ""))
+    pick = ask("Main GPU", [str(i) for i in range(1, len(cards) + 1)], "1", a.yes or a.check)
+    if int(pick) > 1:
+        global GPU_ORDER_GIVEN
+        GPU_ORDER_GIVEN = True
+        main = cards[int(pick) - 1]
+        cards = [main] + [g for g in cards if g is not main]
+    return [g["index"] for g in cards]
+
+
 def choose_gpus(a, found) -> list:
     """Which cards this install uses: --gpus / --gpu, or asked when two or more can share the model (the two best
-    together recommended), else the supported card with the most VRAM.  Returns their numbers, the main one first."""
+    together recommended), else the supported card with the most VRAM.  Asked a second time which of the chosen
+    cards is the MAIN one (ask_gpu_order: GPU_ORDER_GIVEN says the user named one other than the recommended).
+    Returns their numbers, the main one first."""
     if a.gpus:
         sel = parse_gpus(a.gpus, found)
         check_gpus(sel, found, yes=a.yes, named=str(a.gpus).strip().lower() != "all")
@@ -1328,7 +1356,8 @@ def choose_gpus(a, found) -> list:
     for g in short:
         say(f"     ({split_short_note(g)})")
     pick = opts[int(ask("Which GPUs?", [str(i) for i in range(1, len(opts) + 1)], str(rec), a.yes or a.check)) - 1]
-    return [g["index"] for g in pick]
+    return ask_gpu_order(a, pick)     # and which of those cards is the main one (GPU_ORDER_GIVEN says the user
+                                      # named it: the config then keeps that order, "gpu_order": "as_given")
 
 
 def split_mmap(cfg: dict) -> bool:
@@ -7053,7 +7082,13 @@ def main() -> int:
     if multi:                                          # a layer split across these cards (the server adds the flag)
         cfg["gpu"] = multi
         cfg["layer_split"] = a.layer_split or "auto"
-        ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
+        if GPU_ORDER_GIVEN:                            # the user named the main card at setup: keep exactly that
+            cfg["gpu_order"] = "as_given"              # order at every start.  Not a SETUP_KEYS entry: a setup
+                                                       # run again keeps it through carry_over (it is the user's
+                                                       # choice).  Without it serve/server.py's ordered_gpus puts
+                                                       # the measured faster card LAST instead (#1352, #1576).
+        ok(f"layer split across GPUs {multi} ({cfg['layer_split']})"
+           + (", main card first as you chose (the config's 'gpu_order': 'as_given')" if GPU_ORDER_GIVEN else ""))
         recommend_remote_expert_opt(cfg, off=a.no_remote_expert_opt)
     if a.replicas is not None and a.replicas >= 2:      # data-parallel replicas (serve/replicas.py), opt-in
         cards = multi if multi else []
