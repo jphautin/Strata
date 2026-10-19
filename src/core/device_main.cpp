@@ -29,18 +29,21 @@ int main(int argc, char** argv) {
     bool list_devices = false;
     bool list_runtimes = false;
     bool probe_cross = false;
+    bool probe_engine = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
         else if (std::strcmp(argv[i], "--list-runtimes") == 0) list_runtimes = true;
         else if (std::strcmp(argv[i], "--probe-cross") == 0) probe_cross = true;
+        else if (std::strcmp(argv[i], "--probe-engine") == 0) probe_engine = true;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("usage: strata-device [--selftest] [--list-devices]\n"
                         "  --list-devices  every GPU the runtime enumerates, numbered as HIP_VISIBLE_DEVICES /\n"
                         "                  CUDA_VISIBLE_DEVICES number them, and whether this binary can run it\n");
 #ifdef STRATA_MULTI_BRAND
             std::printf("  --list-runtimes every GPU this process can drive, both brands, numbered cuda:N / hip:N\n"
-                        "  --probe-cross  run one AMD kernel from the library in THIS process (its CUDA is up)\n");
+                        "  --probe-cross  run one AMD kernel from the library in THIS process (its CUDA is up)\n"
+                        "  --probe-engine open the HIP-built ENGINE library (its stage code, no layer runs)\n");
 #endif
             return 0;
         } else {
@@ -140,6 +143,24 @@ int main(int argc, char** argv) {
         return ran ? 0 : 3;
 #else
         std::fprintf(stderr, "strata-device: --probe-cross needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
+        return 2;
+#endif
+    }
+
+    // B.1 at its widest: open the HIP-built ENGINE library (strata_engine built SHARED by the HIP build, whose
+    // extern "C" entries live in src/hip/engine_bridge.cpp) and ask it what it is WITHOUT running a layer.  The
+    // answer decides whether the AMD layers can be routed through it at all: the library has to say which arches
+    // its device code holds, how many AMD cards its own HIP runtime sees from INSIDE it, and that the stage
+    // entry (and the kernels behind it) linked in.
+    if (probe_engine) {
+#ifdef STRATA_MULTI_BRAND
+        const bool ok = strata::core::engine_stage_ready();
+        const std::string& d = strata::core::engine_stage_detail();
+        std::printf("engine stage library: %s\n",
+                    ok ? d.c_str() : "none (no HIP-built engine library next to this engine)");
+        return ok ? 0 : 3;
+#else
+        std::fprintf(stderr, "strata-device: --probe-engine needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
         return 2;
 #endif
     }

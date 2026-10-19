@@ -8,6 +8,7 @@
 // symbols by name, an ABI check, and "no library = keep the path this build already had".
 #include "strata/core/device.hpp"
 #include "strata/core/hip_kernels_abi.hpp"
+#include "strata/core/hip_engine_abi.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -133,9 +134,93 @@ const Hip& hip_lib() {
     return L;
 }
 
+// The HIP-built ENGINE library (strata_hip_engine: the DLL a multi-brand HIP build makes from the same objects
+// as its own strata_engine; its entries live in src/hip/engine_bridge.cpp).  This is B.1 at its widest: the
+// AMD side keeps the engine's STAGE code and the kernels ROCm's clang built for its own arch, so what crosses
+// the boundary is a stage and not one of the tree's 482 kernels.  Opening it is separate from opening
+// strata_hip_kernels on purpose: the small library gates the runtime join (M1/M2), this one carries the
+// layers, and the two are measured apart.
+struct Eng {
+    bool ok = false;
+    StrataEngineProbe p{};
+    std::string path;
+    void* h = nullptr;
+    strata_engine_probe_fn probe = nullptr;
+};
+
+Eng open_engine_lib() {
+    Eng L;
+#if defined(STRATA_USE_HIP)
+    // This build IS the AMD side: the stage code is compiled into this executable already, so there is nothing
+    // to open.  Only the CUDA engine build needs the library.
+    std::fprintf(stderr, "strata: this engine was built for AMD cards (HIP): the stage code is native here; "
+                         "strata_engine belongs to the CUDA engine build\n");
+    return L;
+#else
+    L.path = own_folder() + STRATA_HIP_ENGINE_LIB_NAME;
+#if defined(_WIN32)
+    void* h = (void*) LoadLibraryA(L.path.c_str());
+#else
+    void* h = dlopen(L.path.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (h == nullptr) {
+        std::fprintf(stderr, "strata: %s is not next to the engine: no AMD stage code in this process\n",
+                     STRATA_HIP_ENGINE_LIB_NAME);
+        return L;
+    }
+    const auto abi = (strata_engine_abi_fn) sym(h, "strata_engine_abi");
+    const auto probe = (strata_engine_probe_fn) sym(h, "strata_engine_probe");
+    const long long a = abi ? abi() : 0;
+    if (probe == nullptr || a / 1000000 != STRATA_HIP_ENGINE_ABI_VERSION ||
+        a % 1000000 != (long long) sizeof(StrataEngineProbe)) {
+        std::fprintf(stderr, "strata: %s is from another engine version, or its stage block is another "
+                             "size: no AMD stage code in this process\n",
+                     L.path.c_str());
+        return L;
+    }
+    // Ask the library what it is BEFORE any stage runs: which arches its device code holds, how many AMD cards
+    // its own HIP runtime sees, and that the stage entry (and the kernels behind it) really linked in.
+    if (probe(&L.p) != 0) {
+        std::fprintf(stderr, "strata: %s refused its stage probe\n", L.path.c_str());
+        return L;
+    }
+    if (L.p.stage_linked != 1) {
+        std::fprintf(stderr, "strata: %s has no stage entry: it cannot run a layer in this process\n",
+                     L.path.c_str());
+        return L;
+    }
+    L.h = h;
+    L.probe = probe;
+    L.ok = true;
+    std::fprintf(stderr, "strata: AMD stage code from %s (STRATA_MULTI_BRAND=1): code for %s, %d AMD device(s) "
+                         "seen from inside its own HIP runtime\n",
+                 L.path.c_str(), L.p.archs, L.p.hip_devices);
+    return L;
+#endif
+}
+
+const Eng& engine_lib() {
+    static const Eng L = open_engine_lib();
+    return L;
+}
+
 }  // namespace
 
 bool hip_kernels_ready() { return hip_lib().ok; }
+bool engine_stage_ready() { return engine_lib().ok; }
+
+// One line saying what the HIP-built engine library is: its path, the arches its device code holds, and how
+// many AMD cards its OWN HIP runtime sees.  Empty when there is no such library in this process (the normal
+// case for a single-brand build or an engine with no library next to it).
+const std::string& engine_stage_detail() {
+    static const std::string s = [] {
+        const Eng& L = engine_lib();
+        if (!L.ok) return std::string();
+        return L.path + ": code for " + L.p.archs + ", " + std::to_string(L.p.hip_devices) +
+               " AMD device(s) seen from inside its own HIP runtime";
+    }();
+    return s;
+}
 
 // The card order the user chose at setup (setup.py asks which card is the MAIN one and keeps the answer in the
 // run config: "gpu" with the main card first, plus "gpu_order": "as_given").  The launcher passes that answer

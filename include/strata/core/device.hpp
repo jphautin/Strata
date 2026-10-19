@@ -112,6 +112,15 @@ const std::string& card_order_text();
 // whose CUDA runtime is already up and is still holding VRAM, and print each card's free VRAM around it.
 bool cross_runtime_probe();
 
+// B.1 at its widest: the HIP-built engine library (strata_engine built SHARED by a multi-brand HIP build, whose
+// extern "C" entries live in src/hip/engine_bridge.cpp).  engine_stage_ready() is true when the library opened
+// next to this engine, its ABI and stage-block size matched, and its stage entry (and the kernels behind it)
+// linked in - which is what a stage needs before any layer is routed through it. engine_stage_detail() is one
+// line saying what the library is: the arches its device code holds, the AMD cards its OWN HIP runtime sees,
+// and the number of stage entries it offered.  "" when there is no such library in this process.
+bool engine_stage_ready();
+const std::string& engine_stage_detail();
+
 // STRATA_PRIMARY_DEVICE (generate.cpp): the ordinal the engine's own session runs on; 0 = the runtime's first
 // visible device (upstream's behavior).  The Windows HIP runtime enumerates the cards in a fixed order no
 // HIP_VISIBLE_DEVICES list can change (it only filters), so a PC whose faster card comes second could not run

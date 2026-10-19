@@ -582,11 +582,35 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+  # The engine's stage code, in ONE source list.  A normal build gets the static library; B.1's multi-brand
+  # HIP build ALSO gets a DLL made from the SAME objects (strata_hip_engine), which the CUDA engine opens at
+  # run time.  One list, so no second copy of it can drift (RISKS.md R6).
+  set(STRATA_ENGINE_SOURCES src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+  if(STRATA_MULTI_BRAND AND STRATA_ENABLE_HIP)
+    # B.1's big piece, and its shape: the AMD side keeps its NATIVE kernels, so the WHOLE stage code is built
+    # here and handed over as ONE library the CUDA engine opens - not 482 kernel entry points through a table.
+    # These sources are direct members of the target (not an archive), so all of them are in the library, and
+    # the calls they make into strata_kernels force those kernel objects in at link time: a kernel a stage
+    # needs could not be missing quietly - the link would fail with an unresolved symbol.  The bridge TU holds
+    # the extern "C" entries; everything else inside stays plain C++, seen only by this toolchain.
+    # strata_hip_engine is the DLL the CUDA engine opens; strata_engine stays the static library this build's
+    # own engine links (unchanged edges).  Making strata_engine itself SHARED broke that link: lld-link exports
+    # only what is marked, so strata.exe lost 21 engine symbols (measured in build-hip-mb).  ONE source list
+    # feeds both targets, so no second copy can drift (RISKS.md R6) - the price is that these 18 units compile
+    # twice in a multi-brand HIP build; the build minutes are measured, see PLAN-B.md.
+    add_library(strata_engine STATIC ${STRATA_ENGINE_SOURCES})
+    add_library(strata_hip_engine SHARED ${STRATA_ENGINE_SOURCES} src/hip/engine_bridge.cpp)
+    target_include_directories(strata_hip_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(strata_hip_engine PRIVATE STRATA_HIP_ENGINE=1)
+    target_link_libraries(strata_hip_engine PRIVATE strata_core strata_kernels strata_kernels_cpu
+                                                    ${_strata_gpu_runtime_target})
+  else()
+    add_library(strata_engine STATIC ${STRATA_ENGINE_SOURCES})
+  endif()
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)

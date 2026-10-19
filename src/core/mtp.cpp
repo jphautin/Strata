@@ -843,8 +843,18 @@ void mtp_list_nodes(cudaGraph_t graph, const char* what) {
         if (ty == hipGraphNodeTypeKernel) {
             hipKernelNodeParams kp{};
             if (hipGraphKernelNodeGetParams(nd, &kp) == hipSuccess && kp.func != nullptr) {
+#if defined(_WIN32)
+                // Windows' HIP runtime cannot answer this: hipKernelNameRefByPtr is declared in
+                // hip_runtime_api.h but NOT exported - measured on ROCm 7.2 here, absent from
+                // lib/amdhip64.lib's exports and from every ROCm DLL on this PC.  The symbol is what makes an
+                // AMD engine link at all (a reference in an already-compiled object is enough), so asking the
+                // node for its NAME is the one part that has to stay Linux-only.  The node is still known to
+                // be a kernel, and its launch config came back fine.
+                name = "kernel";
+#else
                 const char* fn = hipKernelNameRefByPtr(kp.func, nullptr);
                 if (fn != nullptr) name = fn;
+#endif
             }
         }
 #else
