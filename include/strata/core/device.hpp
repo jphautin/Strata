@@ -100,6 +100,14 @@ bool device_summary(int ordinal, std::string& name, std::string& detail);
 std::vector<DeviceInfo> union_device_list();
 bool hip_kernels_ready();
 
+// What union_device_list() did the last time it ran: `card_order_chosen()` is true when the order came from
+// STRATA_GPU_ORDER (the order the user chose at setup, see apply_chosen_order in src/core/hip_kernels_loader.cpp),
+// and `card_order_text()` is the value that was applied.  false / "" when the process kept its runtime's own
+// order - either nothing was given, or what was given did not name every card and was refused, with the reason
+// printed.
+bool card_order_chosen();
+const std::string& card_order_text();
+
 // The measurement that gates routing the AMD layers here: run one AMD kernel from the library in THIS process,
 // whose CUDA runtime is already up and is still holding VRAM, and print each card's free VRAM around it.
 bool cross_runtime_probe();

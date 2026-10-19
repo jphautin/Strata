@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
 #ifndef NOMINMAX
@@ -81,7 +82,8 @@ int main(int argc, char** argv) {
     //     arch gfx1201, 15.9 GiB
     if (list_runtimes) {
 #ifdef STRATA_MULTI_BRAND
-        for (const strata::core::DeviceInfo& d : strata::core::union_device_list()) {
+        const auto cards = strata::core::union_device_list();
+        for (const strata::core::DeviceInfo& d : cards) {
             const bool hip = d.runtime == strata::core::DeviceRuntime::HIP;
             std::printf("%s%d: %s\n", hip ? "hip" : "cuda", d.ordinal, d.name.c_str());
             if (hip)
@@ -90,6 +92,30 @@ int main(int argc, char** argv) {
                 std::printf("  compute capability %d.%d, %s\n", d.cc_major, d.cc_minor,
                             human(d.total_bytes).c_str());
         }
+        // The placement order, in the same list: the MAIN card first, then the second card, then the RAM
+        // tier (the experts no card holds).  Which card is main is the user's choice, asked at setup and
+        // saved in the run config; the launcher carries it as STRATA_GPU_ORDER.  Nothing here ranks the
+        // cards by power: a CUDA card and an RDNA card share no unit.
+        std::string ids;
+        for (const strata::core::DeviceInfo& d : cards) {
+            const bool hip = d.runtime == strata::core::DeviceRuntime::HIP;
+            ids += (ids.empty() ? std::string("placement order: ") : std::string(" then "))
+                   + (hip ? "hip:" : "cuda:") + std::to_string(d.ordinal);
+        }
+        std::string note;
+        if (cards.size() < 2)
+            note = " - one card only: it holds the layers, and RAM holds the experts no card can";
+        else if (strata::core::card_order_chosen())
+            note = " (the order you chose at setup, STRATA_GPU_ORDER=\""
+                   + strata::core::card_order_text() + "\")";
+        else {
+            const char* given = std::getenv("STRATA_GPU_ORDER");
+            note = given ? " (an order WAS given (STRATA_GPU_ORDER) but could not be used - see the line above; "
+                          "this build's own runtime lists its cards first, so the layers did not move)"
+                         : " (nothing chosen at setup: this build's own runtime lists its cards first; the measured"
+                           " default of a same-brand split puts the FASTER card last, docs/MULTI_GPU.md)";
+        }
+        std::printf("%s%s\n", ids.c_str(), note.c_str());
 #ifdef STRATA_USE_HIP
         std::printf("AMD kernels library: not applicable (this engine is the HIP side; the CUDA engine build opens it)\n");
 #else

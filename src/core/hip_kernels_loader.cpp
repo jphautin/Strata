@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -136,6 +137,83 @@ const Hip& hip_lib() {
 
 bool hip_kernels_ready() { return hip_lib().ok; }
 
+// The card order the user chose at setup (setup.py asks which card is the MAIN one and keeps the answer in the
+// run config: "gpu" with the main card first, plus "gpu_order": "as_given").  The launcher passes that answer
+// down in the same style as its other settings (serve/server.py's child_env sets CUDA_VISIBLE_DEVICES /
+// HIP_VISIBLE_DEVICES and STRATA_PRIMARY_DEVICE as environment variables): STRATA_GPU_ORDER="hip:0,cuda:0",
+// brand-tagged ids as parse_device_id reads them, or plain ordinals for this build's own runtime.  The MAIN
+// card is the one a stage goes on FIRST; then the second card; then the RAM tier for the experts.  This does
+// NOT rank the cards: no unit is shared by an NVIDIA card and an RDNA card, so "more powerful" is never decided
+// here - only the order the user already named is applied.  An order that does not name every card this process
+// has is not applied at all, and the reason is printed, so a typo cannot silently put the layers on another
+// card than the one you chose.
+static bool order_applied = false;
+static std::string order_text;
+
+static void apply_chosen_order(std::vector<DeviceInfo>& cards) {
+    order_applied = false;
+    order_text.clear();
+    if (cards.size() < 2) return;                  // one card: there is nothing to order
+    const char* raw = std::getenv("STRATA_GPU_ORDER");
+    if (raw == nullptr) return;                    // nobody chose: the runtime's own order stands
+    std::vector<std::string> toks;
+    std::string tok;
+    for (const char c : std::string(raw)) {
+        if (c == ',' || c == ';' || c == ' ') {
+            if (!tok.empty()) toks.push_back(tok);
+            tok.clear();
+        } else if (c != '\0') {
+            tok.push_back(c);
+        }
+    }
+    if (!tok.empty()) toks.push_back(tok);
+    if (toks.empty()) return;                      // an empty value is the same as none set
+
+    const DeviceRuntime own_rt = cards[0].runtime;  // this build's own runtime, which lists its cards first
+    std::vector<DeviceInfo> rest = cards;
+    std::vector<DeviceInfo> head;
+    std::string why;
+    for (const std::string& t : toks) {
+        DeviceRuntime r = DeviceRuntime::OWN;
+        int ord = -1;
+        if (!parse_device_id(t, r, ord)) {
+            why = t + " is not a card id (use cuda:N, hip:N, or a plain number for this engine's own runtime)";
+            break;
+        }
+        const DeviceRuntime want = r == DeviceRuntime::OWN ? own_rt : r;
+        size_t hit = rest.size();
+        for (size_t k = 0; k < rest.size(); ++k) {
+            if (rest[k].ordinal == ord && rest[k].runtime == want) {
+                hit = k;
+                break;
+            }
+        }
+        if (hit == rest.size()) {
+            why = t + " names a card this process does not have";
+            break;
+        }
+        head.push_back(rest[hit]);
+        rest.erase(rest.begin() + hit);
+    }
+    if (why.empty() && head.size() != cards.size())
+        why = "the list does not name every card this process has";
+    if (!why.empty()) {
+        std::fprintf(stderr, "strata: STRATA_GPU_ORDER \"%s\": %s. The card order is NOT applied: the layers "
+                             "stay in the order this process's runtime lists them in\n",
+                     raw, why.c_str());
+        return;
+    }
+    cards = head;
+    order_applied = true;
+    order_text = raw;
+    std::fprintf(stderr, "strata: card order from STRATA_GPU_ORDER \"%s\": main card first, then the second "
+                         "card\n",
+                 raw);
+}
+
+bool card_order_chosen() { return order_applied; }
+const std::string& card_order_text() { return order_text; }
+
 // BOTH cards in ONE process, measured.  This gates the NEXT step (the AMD layers' real kernels route through
 // this library): a code object that loads but cannot run, or an AMD card whose memory HIP can claim while
 // CUDA still holds its own, would make that step pointless.  Prints what it measured; true = the AMD kernel
@@ -217,6 +295,7 @@ std::vector<DeviceInfo> union_device_list() {
         i.free_bytes = h.free_bytes;
         out.push_back(i);
     }
+    apply_chosen_order(out);   // the user's order from the config, if one was given (STRATA_GPU_ORDER)
     return out;
 }
 
