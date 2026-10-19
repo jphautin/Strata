@@ -354,6 +354,86 @@ bool cross_runtime_probe() {
     return hip_ran;
 }
 
+// The shape a layer's hand-off needs, measured without a model or a weight: the library builds the ENGINE's OWN
+// arena on the AMD card (src/core/device.cu: it allocates, and with poison=true its poison_kernel writes NaNs),
+// and 16 floats come back into a host buffer THIS process owns.  CUDA holds its own 256 MiB the whole time, so
+// the AMD hold cannot be read as "both runtimes share one pool", and a free-VRAM change cannot be bought by
+// nothing being allocated.  true = the arena was built, the engine's kernel wrote it, and the read-back is NaN.
+bool stage_hold_gate(long long bytes, int device) {
+    const Eng& L = engine_lib();
+    if (!L.ok) {
+        std::fprintf(stderr, "strata: the stage-hold gate needs strata_hip_engine next to the engine\n");
+        return false;
+    }
+    const auto hold = (strata_hip_stage_hold_fn) sym(L.h, "strata_hip_stage_hold");
+    const auto release = (strata_hip_stage_free_fn) sym(L.h, "strata_hip_stage_free");
+    if (hold == nullptr || release == nullptr) {
+        std::fprintf(stderr, "strata: %s has no stage entries: it cannot hold a block on the AMD card\n", L.path.c_str());
+        return false;
+    }
+
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    auto own_free = [GiB](int ordinal) {
+        try {
+            const DeviceInfo i = device_info(ordinal);
+            return (double) i.free_bytes / GiB;
+        } catch (const CudaError&) {
+            return -1.0;  // this build cannot run that card; the listing says why
+        }
+    };
+
+    std::unique_ptr<DeviceArena> cuda_hold;
+    const double c0 = own_free(0);
+    try {
+        cuda_hold = std::make_unique<DeviceArena>(256ull << 20, 0, false);  // one cudaMalloc of 256 MiB
+    } catch (const CudaError& e) {
+        std::fprintf(stderr, "strata: could not hold VRAM on GPU 0 (%s)\n", e.what());
+    }
+    const double c1 = own_free(0);
+    std::printf("cuda:0 free %.3f -> %.3f GiB while this engine holds %s (one cudaMalloc)\n", c0, c1,
+                cuda_hold ? "256 MiB" : "nothing");
+    std::fflush(stdout);
+
+    StrataStageRun r{};
+    float host[16] = {};
+    const int e = hold(bytes, device, &r, (int) sizeof(StrataStageRun), host);
+    int n_nan = 0;
+    for (int i = 0; i < 16; ++i) {
+        if (host[i] != host[i]) ++n_nan;  // a NaN is the only value that is not equal to itself
+    }
+    std::printf("hip:%d engine arena %s, asked %lld B, held %lld B, free %.3f -> %.3f GiB (total %.3f), arena %d, "
+                "read-back NaN %d of 16, code %d\n",
+                device, e == 0 ? "held" : "refused", (long long) r.bytes, r.held_bytes,
+                (double) r.free_before / GiB, (double) r.free_after / GiB, (double) r.total_bytes / GiB,
+                r.arena_ok, n_nan, e);
+    std::fflush(stdout);
+
+    // Let go, then ask the SAME library instance for the card again: the arena's own destructor must give the
+    // memory back, and the next small hold shows the card's free went up.  Two different HIP runtimes are not
+    // compared here - both numbers come from the instance that did the hold.
+    release();
+    StrataStageRun again{};
+    float tiny_host[16] = {};
+    const long long small = 64ll << 20;
+    const int e2 = hold(small, device, &again, (int) sizeof(StrataStageRun), tiny_host);
+    std::printf("hip:%d after the release, a fresh %lld MiB hold sees %.3f GiB free (it was %.3f while the "
+                "arena above was held), code %d\n",
+                device, small >> 20, (double) again.free_before / GiB, (double) r.free_after / GiB, e2);
+    std::fflush(stdout);
+    release();
+
+    const double c2 = own_free(0);
+    std::printf("cuda:0 free after all of that: %.3f GiB (was %.3f while only CUDA held)\n", c2, c1);
+    std::fflush(stdout);
+
+    const bool ok = (e == 0 && r.arena_ok == 1 && r.held_bytes > 0 && r.read_back_ok == 1 && n_nan == 16);
+    std::fprintf(stderr, "strata: stage-hold gate: %s.  The lines above are what this measured: the ENGINE's own "
+                         "arena, the ENGINE's own kernel, the AMD card's memory, and a device-to-host copy into "
+                         "a buffer the CUDA engine owns, all while CUDA holds its own 256 MiB\n",
+                 ok ? "PROVEN" : "NOT PROVEN");
+    return ok;
+}
+
 // ONE process, both brands: this build's own runtime first (upstream's numbering), then the AMD cards the
 // library listed from INSIDE its own runtime.  `device_info` tags each of its own cards with the runtime it
 // actually is, so the list says which brand each ordinal belongs to.

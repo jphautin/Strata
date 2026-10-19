@@ -17,9 +17,13 @@
 #include "strata/core/device.hpp"
 #include "strata/core/layer.hpp"
 
+#include <hip/hip_runtime.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <memory>
 
 #if defined(_WIN32)
 #define STRATA_HIP_ENGINE_EXPORT extern "C" __declspec(dllexport)
@@ -43,6 +47,11 @@ static void* const head_entry = (void*) (std::uintptr_t) &gdn_layer;
 
 namespace {
 
+// The block this library is holding on an AMD card, if any.  It is held here - not on the caller's side - so
+// the CUDA engine can look at the card's free memory while the block is alive, and then ask for it back.  The
+// arena's own destructor is what gives the memory to the card again.
+std::unique_ptr<strata::core::DeviceArena> g_arena;
+
 void fill_engine_probe(void* out) {
     StrataEngineProbe* p = (StrataEngineProbe*) out;
     std::memset(p, 0, sizeof(StrataEngineProbe));
@@ -65,3 +74,50 @@ STRATA_HIP_ENGINE_EXPORT int strata_engine_probe(void* out) {
     fill_engine_probe(out);
     return 0;
 }
+
+// Hold ONE block on an AMD card through the ENGINE's own arena, from inside this library, and give the 16
+// floats back into a buffer the CALLER owns.  Nothing here is a stand-in: DeviceArena is src/core/device.cu
+// (it allocates, and with poison=true its poison_kernel writes NaNs), so this run exercises the engine's
+// allocator, the engine's kernel, this card's memory, and a device-to-host copy - which is what a layer's
+// hand-off needs, before any model or weight is involved.
+//
+// Return: 0 = held and measured. -1 = null argument or the two sides disagree on the block size. -2 = the
+// engine's arena refused (its own CudaError). Any other negative = the HIP error code of the step that
+// failed, so the caller prints which step died.
+STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_hold(long long bytes, int device, void* out, int expect_size,
+                                                   float* host_dst) {
+    StrataStageRun* o = (StrataStageRun*) out;
+    if (o == nullptr || host_dst == nullptr || (int) sizeof(StrataStageRun) != expect_size) return -1;
+    std::memset(o, 0, sizeof(StrataStageRun));
+    o->bytes = bytes;
+    o->device = device;
+
+    hipError_t e = hipSetDevice(device);
+    if (e != hipSuccess) return -(int) e;
+    size_t total = 0;
+    if (hipMemGetInfo(&o->free_before, &total) == hipSuccess) o->total_bytes = total;
+
+    try {
+        g_arena = std::make_unique<strata::core::DeviceArena>((uint64_t) bytes, device, /*poison=*/true);
+        o->arena_ok = 1;
+        o->held_bytes = g_arena->capacity();
+    } catch (const strata::core::CudaError&) {
+        return -2;
+    } catch (const std::exception&) {
+        return -2;
+    }
+    hipMemGetInfo(&o->free_after, &total);
+
+    if (hipMemcpy(host_dst, g_arena->base(), 16 * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess)
+        return -3;
+    int n_nan = 0;
+    for (int i = 0; i < 16; ++i) {
+        if (host_dst[i] != host_dst[i]) ++n_nan;  // a NaN is the only value that is not equal to itself
+    }
+    o->read_back_ok = (n_nan == 16) ? 1 : 0;
+    return 0;
+}
+
+// Let go: the arena's own destructor gives the card's memory back. The CUDA side does this once per run, so
+// what is measured is "held while CUDA holds its own", not "two pools that never end".
+STRATA_HIP_ENGINE_EXPORT void strata_hip_stage_free() { g_arena.reset(); }

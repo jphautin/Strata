@@ -5,6 +5,9 @@
 // architecture, and this refuses to RUN on one.
 #include "strata/core/device.hpp"
 #include "strata/plan/plan.hpp"
+#ifdef STRATA_MULTI_BRAND
+#include "strata/core/hip_engine_abi.hpp"  // the engine library's ABI, and stage_hold_gate's declaration
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -30,12 +33,14 @@ int main(int argc, char** argv) {
     bool list_runtimes = false;
     bool probe_cross = false;
     bool probe_engine = false;
+    bool stage_hold = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
         else if (std::strcmp(argv[i], "--list-runtimes") == 0) list_runtimes = true;
         else if (std::strcmp(argv[i], "--probe-cross") == 0) probe_cross = true;
         else if (std::strcmp(argv[i], "--probe-engine") == 0) probe_engine = true;
+        else if (std::strcmp(argv[i], "--stage-hold") == 0) stage_hold = true;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("usage: strata-device [--selftest] [--list-devices]\n"
                         "  --list-devices  every GPU the runtime enumerates, numbered as HIP_VISIBLE_DEVICES /\n"
@@ -43,7 +48,9 @@ int main(int argc, char** argv) {
 #ifdef STRATA_MULTI_BRAND
             std::printf("  --list-runtimes every GPU this process can drive, both brands, numbered cuda:N / hip:N\n"
                         "  --probe-cross  run one AMD kernel from the library in THIS process (its CUDA is up)\n"
-                        "  --probe-engine open the HIP-built ENGINE library (its stage code, no layer runs)\n");
+                        "  --probe-engine open the HIP-built ENGINE library (its stage code, no layer runs)\n"
+                        "  --stage-hold  hold 256 MiB on hip:0 through that library's ENGINE arena, then read its\n"
+                        "                  NaNs back into THIS process's RAM (the layer hand-off's shape)\n");
 #endif
             return 0;
         } else {
@@ -161,6 +168,19 @@ int main(int argc, char** argv) {
         return ok ? 0 : 3;
 #else
         std::fprintf(stderr, "strata-device: --probe-engine needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
+        return 2;
+#endif
+    }
+
+    // The shape a layer's hand-off needs, measured before any model or weight exists: this process (CUDA, MSVC)
+    // asks the HIP-built library to build the ENGINE's OWN arena on the AMD card, and 16 floats come back into
+    // RAM this process owns.  CUDA holds its own 256 MiB the whole time, so the AMD hold cannot be mistaken for
+    // one shared pool, and the read-back cannot be bought by nothing being allocated.  exit 0 = proven, 3 = not.
+    if (stage_hold) {
+#ifdef STRATA_MULTI_BRAND
+        return strata::core::stage_hold_gate(256ll << 20, 0) ? 0 : 3;
+#else
+        std::fprintf(stderr, "strata-device: --stage-hold needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
         return 2;
 #endif
     }
