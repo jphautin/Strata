@@ -434,6 +434,101 @@ bool stage_hold_gate(long long bytes, int device) {
     return ok;
 }
 
+// C.1's measurement, taken on the ENGINE's side: ask the HIP-built library to build and run ONE real engine
+// stage - its own weight table, its own native projections of that layer range, its own session carve, its own
+// VRAM expert tier and its own Verifier, all made on the AMD card inside the library - and take the hand-off
+// payload it wrote into RAM THIS process owns.  The library prints what it measured (GiB and seconds per step);
+// this side prints the bytes it RECEIVED and its OWN hash of them, so the crossing is measured at the byte
+// level rather than by a shape both sides agreed to write.  true = the stage ran, every expert of it was in the
+// tier (so no CPU expert pool was asked across the join, which is what C.5 still has to wire), and the hash of
+// the floats this process holds is the hash the library reported over the floats it wrote.
+bool stage_run_gate(const StrataStageArgs& args) {
+    const Eng& L = engine_lib();
+    if (!L.ok) {
+        std::fprintf(stderr, "strata: the stage gate needs strata_hip_engine next to the engine\n");
+        return false;
+    }
+    const auto run = (strata_hip_stage_run_fn) sym(L.h, "strata_hip_stage_run");
+    const auto take = (strata_hip_stage_payload_fn) sym(L.h, "strata_hip_stage_payload");
+    if (run == nullptr || take == nullptr) {
+        std::fprintf(stderr, "strata: %s has no stage entries: it cannot run a stage in this process\n",
+                     L.path.c_str());
+        return false;
+    }
+
+    StrataStageOut o{};
+    const int e = run(&args, (int) sizeof(StrataStageArgs), &o, (int) sizeof(StrataStageOut));
+    if (e != 0) {
+        std::fprintf(stderr, "strata: the stage refused (code %d, step %d): %s\n", e, o.refused_step, o.err);
+        return false;
+    }
+
+    // the payload, as the library reported it: rows of handoff_floats floats each.  This side sizes its OWN
+    // buffer from those numbers and receives the floats by name - there is no handle across the join.
+    const long long want = o.payload_bytes / (long long) sizeof(float);
+    if (want < 1 || want > (long long) 1 << 28) {
+        std::fprintf(stderr, "strata: the stage reported a payload of %lld floats: nothing to take\n", want);
+        return false;
+    }
+    std::vector<float> host((size_t) want, 0.0f);
+    const int got = take(host.data(), (int) want);
+    if (got != (int) want) {
+        std::fprintf(stderr, "strata: the stage wrote %lld floats and %d came back: the crossing did not carry "
+                             "the hand-off\n", want, got);
+        return false;
+    }
+
+    auto fnv = [](const void* pv, size_t n) {
+        unsigned long long h = 1469598125565353939ull;
+        for (const unsigned char* b = (const unsigned char*) pv, * e2 = b + n; b != e2; ++b)
+            h = (((unsigned long long) (*b)) ^ h) * 10995116277794481ull;
+        return h;
+    };
+    const unsigned long long here = fnv(host.data(), host.size() * sizeof(float));
+
+    int nan = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (host[i] != host[i]) ++nan;      // a NaN is the only value that is not equal to itself
+    }
+
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    std::printf("stage: layers [%d, %d) ran INSIDE %s on hip:%d (%d AMD cards, code for %s), of %d layers\n",
+                o.lb, o.le, L.path.c_str(), o.device, o.hip_devices, o.archs, o.n_layers);
+    std::printf("stage: arena %.3f GiB + native %.3f GiB + Q8 %.3f GiB + tier %.3f GiB (%d experts) + session %.1f "
+                "MiB + token table %.1f MiB host; card %.3f -> %.3f GiB free; load %.1f s, tier fill %.1f s, "
+                "window %.1f ms\n",
+                (double) o.arena_bytes / GiB, (double) o.dense_bytes / GiB, (double) o.hc_q8_bytes / GiB,
+                (double) o.cache_bytes / GiB, o.resident_experts, (double) o.session_bytes / 1048576.0,
+                (double) o.embed_bytes / 1048576.0, (double) o.free_before / GiB, (double) o.free_after / GiB,
+                o.build_s, o.fill_s, o.run_ms);
+    std::printf("stage: the hand-off crossed: %d floats per row, the buffer held %d rows, the window wrote %lld "
+                "of them = %lld B; the library's hash of what it wrote %016llx, THIS process's hash of what it "
+                "received %016llx (RAM at %p)\n",
+                o.handoff_floats, o.rows,
+                (o.handoff_floats > 0 ? o.payload_bytes / ((long long) o.handoff_floats * (long long) sizeof(float)) : 0LL),
+                o.payload_bytes, o.payload_hash, here, (void*) host.data());
+    std::printf("stage: the first values as they came back: ");
+    for (int i = 0; i < 8; ++i) std::printf("%.6g ", (double) host[i]);
+    std::printf("  (the library read %d, NaN %d of 8 here and %d there)\n", o.read_back_ok, nan, o.nan_count);
+    std::fflush(stdout);
+
+    const bool ok = (e == 0 && o.zero_doorbell == 1 && o.read_back_ok == 1 && nan == 0 && o.nan_count == 0 &&
+                     here == o.payload_hash && o.resident_experts > 0 && o.run_ms >= 0.0);
+    std::fprintf(stderr, "strata: stage gate: %s.  The lines above are what this measured: the stage built and "
+                         "ran on the AMD card INSIDE the HIP-built library, in a process whose CUDA runtime is "
+                         "already up, with no CPU expert pool across the join, and the payload's bytes hashed the "
+                         "same on both sides\n", ok ? "PROVEN" : "NOT PROVEN");
+    if (!ok) {
+        if (here != o.payload_hash)
+            std::fprintf(stderr, "strata:   the two hashes differ: the crossing did not carry the same bytes\n");
+        if (o.zero_doorbell != 1)
+            std::fprintf(stderr, "strata:   the window asked a CPU expert pool: the experts are not all in the "
+                                 "tier (C.5's shape)\n");
+    }
+    return ok;
+}
+
+
 // ONE process, both brands: this build's own runtime first (upstream's numbering), then the AMD cards the
 // library listed from INSIDE its own runtime.  `device_info` tags each of its own cards with the runtime it
 // actually is, so the list says which brand each ordinal belongs to.

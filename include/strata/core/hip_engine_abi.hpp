@@ -13,7 +13,7 @@
 
 #include <string>
 
-#define STRATA_HIP_ENGINE_ABI_VERSION 1
+#define STRATA_HIP_ENGINE_ABI_VERSION 2   // 2 = plus the real stage entry (C.1); a version-1 library refuses
 
 #if defined(_WIN32)
 #define STRATA_HIP_ENGINE_LIB_NAME "strata_hip_engine.dll"
@@ -47,6 +47,69 @@ struct StrataStageRun {
     unsigned long long total_bytes = 0;      // the card's total, for the print
 };
 
+// ================================ C.1: ONE REAL ENGINE STAGE, INSIDE THIS LIBRARY ================================
+//
+// What the CUDA engine asks the library to do, as plain data: where the model is, which layer range this stage
+// owns, the window's ids, and which AMD card.  Everything else the stage needs is built INSIDE the library, on
+// the AMD card, by the library's own objects - the weight table, the native projections of ITS layers, the
+// session carve of that range, the VRAM expert tier filled from the pack, and the Verifier whose graphs it then
+// replays.  Those objects hold device pointers and std::strings, and a CUDA-side cudaMalloc would ask the
+// NVIDIA card, so not one of them may be made on the caller's side and read here: only this block crosses.
+//
+// The shape is the tree's own, read before writing (CODE.md Appendix A): a stage IS a Verifier
+// (include/strata/core/verify.hpp:79) plus set_stage(lb, le, hand_in, hand_out) (:173), and the payload per row
+// is hc*n_embd + n_embd + hc floats - the residual R, the previous stage's pending write bo, and inject
+// (handoff_floats, :194).  Both hand-off pointers are read and written INSIDE a captured graph as device-
+// visible addresses (verify.cpp:1076-1083 reads, :2090-2099 writes), so the library owns one mapped pinned
+// buffer, and the payload comes back into the caller's RAM by a copy the library does after the window - the
+// only channel two runtimes share is host RAM (hip_kernels_abi.hpp and docs/MULTI_GPU.md:63-65).
+struct StrataStageArgs {
+    char pack[256];          // the pack dir (index.txt, dense.bin, native_experts.txt)
+    char native[512];        // shard 1 of the model GGUF, as --native names it (gguf_split_paths finds the rest)
+    char tokens[64];         // the window's token ids, comma-separated as --tokens writes them
+    long long lb, le;        // the stage's layers [lb, le); C.1 runs the FIRST one, so lb = 0 and hand_in is null
+    long long max_context;   // cells of session state to carve for that range
+    long long cache_slots;   // expert slots; 0 = every expert of the stage, (le - lb) * n_expert
+    int device;              // the ordinal INSIDE the library's own HIP runtime, as --list-runtimes numbers them
+};
+
+// What the stage measured, as numbers only: the library's arches, its card, the bytes each object took, the
+// time each step cost, and the hand-off payload's size and hash.  Nothing here is a handle - the CUDA engine
+// must not call HIP (the rule at :36-38 above), so it gets a report, and the floats themselves come back
+// through strata_hip_stage_payload below, into RAM the engine owns and hashes.
+struct StrataStageOut {
+    char archs[64];                  // the arches this library's device code holds ("gfx1201,gfx1200")
+    char err[256];                   // what refused, in the engine's own words (empty = the stage ran)
+    long long arena_bytes;           // cudaMalloc for the pack's dense weights, inside the library
+    long long dense_bytes;           // NativeDense's own allocations: this stage's layers only
+    long long hc_q8_bytes;           // the arena's int8 + fp32/32-scale copy (STRATA_HC_REQ8): 0 here, as that
+    // the env is unset on this rig; STRATA_HC_Q8's own copy is NativeDense's and lands in dense_bytes
+    long long embed_bytes;           // NativeEmbed's token table, in mapped HOST memory (costs no VRAM)
+    long long session_bytes;         // the session carve of [lb, le) only - not the whole model's
+    long long cache_bytes;           // ExpertCache::bytes(): the VRAM expert tier this stage runs against
+    long long payload_bytes;         // rows * handoff_floats * 4 the stage wrote into its mapped buffer
+    unsigned long long free_before;  // this AMD card's free VRAM before any of it was built
+    unsigned long long free_after;   // and after the stage's objects were released, so "built" cannot be silent
+    long long window_runs;           // windows this entry ran (the gate runs one)
+    int hip_devices;                 // AMD cards the library sees from inside its own HIP runtime
+    int device;                      // the card it ran on
+    int n_layers, n_expert;          // the geometry the library read from the model's own metadata
+    int hc, n_embd;
+    int lb, le;                      // the range it actually ran
+    int rows;                        // rows of hand-off the mapped buffer holds (kVerifyMaxT unless asked)
+    int handoff_floats;              // floats per row (verify.hpp:194): the caller sizes its own buffer from this
+    int resident_experts;            // (layer, expert) pairs this stage admitted into the VRAM tier
+    int zero_doorbell;               // 1 = ar_live(): EVERY expert of the stage is in VRAM, so no CPU pool was asked
+    int read_back_ok;                // 1 = the library read its own payload back; it is what got hashed
+    int refused_step;                // 0 ran; see the list below in strata_hip_stage_run's comment
+    int nan_count;                   // NaNs among the first 8 payload floats (0 expected: a stage writes numbers)
+    unsigned long long payload_hash; // FNV-1a over the payload bytes, computed by the LIBRARY
+    double build_s;                  // the load: weights, projections, session
+    double fill_s;                   // the expert tier filled from the pack
+    double run_ms;                   // the window itself
+    float first[8];                  // the first eight payload floats, printed as they came back
+};
+
 extern "C" {
 typedef long long (*strata_engine_abi_fn)();
 typedef int (*strata_engine_probe_fn)(void* out);  // out IS a StrataEngineProbe*
@@ -61,6 +124,23 @@ typedef int (*strata_engine_probe_fn)(void* out);  // out IS a StrataEngineProbe
 typedef int (*strata_hip_stage_hold_fn)(long long bytes, int device, void* out, int expect_size,
                                         float* host_dst);  // out IS a StrataStageRun*; host_dst holds 16 floats
 typedef void (*strata_hip_stage_free_fn)();
+
+// The REAL stage entry, on the in-tree template's contract (strata_kq_run at src/prefill/mmq_kq_lib.cu:46
+// and its loader side strata_kq_run_fn run, resolved at mmq_kq_loader.cpp:73): the args block as a void*,
+// the CALLER's own sizeof of it, and the same for the out block - the library refuses before touching either
+// block when a size disagrees.  Return: 0 = the stage ran; -1 = a null argument or a size disagreement;
+// -100 - step = the stage refused at that step (1 the GGUF geometry, 2 the expert layout, 3 the weights,
+// 4 the native projections, 5 the session, 6 the expert tier, 7 the Verifier, 8 NOT every expert of the
+// stage resident - the window would ask a CPU expert pool, and the pool across the join is not wired yet, so
+// it is refused rather than hidden, 9 the window itself, 10 an allocation or the card).
+typedef int (*strata_hip_stage_run_fn)(const void* args, int args_size, void* out, int out_size);
+// The payload's way back: the floats the stage wrote, copied into a buffer the CUDA engine OWNS.  Returns the
+// number of floats copied, or negative when there is no payload left.  The caller sizes its buffer from
+// StrataStageOut's handoff_floats and rows, hashes what it receives, and compares that against payload_hash:
+// two hashes of the same bytes, computed on the two sides of the join, is the measurement that the crossing
+// carried the activations and not a copy of the same buffer.
+typedef int (*strata_hip_stage_payload_fn)(float* dst, int dst_floats);
+
 }
 
 namespace strata::core {
@@ -70,4 +150,10 @@ namespace strata::core {
 // worked in one process that already owns CUDA.  Declared HERE (not in device.hpp) because only a multi-brand
 // build can answer it, and this header is what both sides of the join already share.
 bool stage_hold_gate(long long bytes, int device);
+// C.1's measurement, taken on the engine's side: ask the library to run ONE real stage, take its hand-off
+// payload into RAM this process owns, and true = the stage ran, the payload crossed, and the hash of the
+// bytes THIS side holds equals the hash the LIBRARY reported over the bytes it wrote.  Refuses (false) with
+// the reason printed when there is no such library, when the stage refused, or when the two hashes disagree.
+bool stage_run_gate(const StrataStageArgs& args);
+
 }  // namespace strata::core

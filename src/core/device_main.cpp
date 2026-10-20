@@ -34,6 +34,14 @@ int main(int argc, char** argv) {
     bool probe_cross = false;
     bool probe_engine = false;
     bool stage_hold = false;
+#ifdef STRATA_MULTI_BRAND
+    // C.1's gate: the stage needs a model, so the paths and the range are asked for, with the shape's
+    // defaults around them (one layer, 1024 cells, hip:0, and the ids the daily run uses).
+    bool probe_stage = false;
+    std::string stage_pack, stage_native, stage_tokens = "248045,846";
+    long long stage_layers = 1, stage_context = 1024;
+    int stage_device = 0;
+#endif
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
@@ -41,6 +49,15 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--probe-cross") == 0) probe_cross = true;
         else if (std::strcmp(argv[i], "--probe-engine") == 0) probe_engine = true;
         else if (std::strcmp(argv[i], "--stage-hold") == 0) stage_hold = true;
+#ifdef STRATA_MULTI_BRAND
+        else if (std::strcmp(argv[i], "--probe-stage") == 0) probe_stage = true;
+        else if (i + 1 < argc && std::strcmp(argv[i], "--stage-pack") == 0) stage_pack = argv[++i];
+        else if (i + 1 < argc && std::strcmp(argv[i], "--stage-native") == 0) stage_native = argv[++i];
+        else if (i + 1 < argc && std::strcmp(argv[i], "--stage-tokens") == 0) stage_tokens = argv[++i];
+        else if (i + 1 < argc && std::strcmp(argv[i], "--stage-layers") == 0) stage_layers = std::atoll(argv[++i]);
+        else if (i + 1 < argc && std::strcmp(argv[i], "--stage-context") == 0) stage_context = std::atoll(argv[++i]);
+        else if (i + 1 < argc && std::strcmp(argv[i], "--stage-device") == 0) stage_device = std::atoi(argv[++i]);
+#endif
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("usage: strata-device [--selftest] [--list-devices]\n"
                         "  --list-devices  every GPU the runtime enumerates, numbered as HIP_VISIBLE_DEVICES /\n"
@@ -51,7 +68,9 @@ int main(int argc, char** argv) {
                         "  --probe-engine open the HIP-built ENGINE library (its stage code, no layer runs)\n"
                         "  --stage-hold  hold 256 MiB on hip:0 through that library's ENGINE arena, then read its\n"
                         "                  NaNs back into THIS process's RAM (the layer hand-off's shape)\n");
+            std::printf("  --probe-stage  build and run ONE real engine stage INSIDE that library on the AMD card,\n"                        "                  and bring its hand-off payload back into RAM this process owns;\n"                        "                  --stage-pack DIR --stage-native SHARD1 [--stage-layers K]\n"                        "                  [--stage-context N] [--stage-tokens IDS] [--stage-device D]\n");
 #endif
+
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -184,6 +203,34 @@ int main(int argc, char** argv) {
         return 2;
 #endif
     }
+
+    // C.1: not a probe of the join's shape but the join doing real work - the CUDA-built engine (this
+    // process) asks the HIP-built library to build ONE whole engine stage on the AMD card (its weight
+    // table, the native projections of its own layers, its own session carve, its VRAM expert tier filled
+    // with every expert of the stage, its own Verifier) and to run one verify window through it.  Nothing
+    // but plain data crossed: no handle, no HIP call on this side.  Then the stage's hand-off payload - the
+    // residual rows the next stage would read - comes back into RAM THIS process owns and both sides hash it.
+    // This loads a model, so it costs seconds, not milliseconds: it is the first gate that answers whether a
+    // stage inside the library runs at all.
+#ifdef STRATA_MULTI_BRAND
+    if (probe_stage) {
+        if (stage_pack.empty() || stage_native.empty()) {
+            std::fprintf(stderr, "strata-device: --probe-stage needs --stage-pack DIR and --stage-native SHARD1\n");
+            return 2;
+        }
+        StrataStageArgs a{};
+        auto put = [](char* dst, size_t n, const std::string& s) { std::snprintf(dst, n, "%s", s.c_str()); };
+        put(a.pack, sizeof a.pack, stage_pack);
+        put(a.native, sizeof a.native, stage_native);
+        put(a.tokens, sizeof a.tokens, stage_tokens);
+        a.lb = 0;                       // the FIRST stage: the hand-off in is null, and that is only legal at layer 0
+        a.le = stage_layers;
+        a.max_context = stage_context;
+        a.cache_slots = 0;              // every expert of the stage: the window must not ask a CPU pool across the join
+        a.device = stage_device;
+        return strata::core::stage_run_gate(a) ? 0 : 3;
+    }
+#endif
 
     try {
         const strata::core::DeviceInfo d = strata::core::device_info(0);
