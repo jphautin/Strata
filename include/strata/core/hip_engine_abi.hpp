@@ -13,7 +13,7 @@
 
 #include <string>
 
-#define STRATA_HIP_ENGINE_ABI_VERSION 2   // 2 = plus the real stage entry (C.1); a version-1 library refuses
+#define STRATA_HIP_ENGINE_ABI_VERSION 3   // 3 = plus the per-runtime arena entries (C.4); a version-2 or 1 library refuses
 
 #if defined(_WIN32)
 #define STRATA_HIP_ENGINE_LIB_NAME "strata_hip_engine.dll"
@@ -44,6 +44,24 @@ struct StrataStageRun {
     int read_back_ok = 0;                     // 1 = the 16 floats the CALLER owns came back NaN
     unsigned long long free_before = 0;      // this card's free VRAM before the hold
     unsigned long long free_after = 0;       // and after it, so "held" cannot mean "nothing allocated"
+    unsigned long long total_bytes = 0;      // the card's total, for the print
+};
+
+// C.4: what ONE ARENA of a runtime says about one hold, as plain data.  A mixed build now has one arena PER
+// runtime - this process's own DeviceArena, and the library's own inside its HIP runtime - so a report can
+// only ever carry the numbers of the arena that FILLED it, never the other side's.  The card is named BEFORE
+// the hold (device_summary), so an allocation refusal can print the card and that card's free/total, in
+// generate.cpp:164's shape `(N of M MiB VRAM free on this GPU)`.  cap_gib is the value arena_pin_cap_gib()
+// read ON THAT SIDE - the WDDM cap is per arena, not per process (docs/MULTI_GPU.md:340-343).
+struct StrataArenaReport {
+    long long bytes = 0;                     // what was asked of that arena
+    long long held_bytes = 0;                // what that arena actually took (0 = it refused)
+    int device = -1;                         // the card it lives on, as THAT runtime numbers its cards
+    int arena_ok = 0;                        // 1 = that arena exists in that runtime
+    long long cap_gib = -1;                  // arena_pin_cap_gib() read there: -1 unset / -2 auto / 0 the whole arena / N GiB
+    char card[48] = "";                      // the card's name, filled BEFORE the hold, so a refusal can name it
+    unsigned long long free_before = 0;      // that card's free VRAM before the hold
+    unsigned long long free_after = 0;       // and after (0 = the hold never happened)
     unsigned long long total_bytes = 0;      // the card's total, for the print
 };
 
@@ -141,6 +159,14 @@ typedef int (*strata_hip_stage_run_fn)(const void* args, int args_size, void* ou
 // carried the activations and not a copy of the same buffer.
 typedef int (*strata_hip_stage_payload_fn)(float* dst, int dst_floats);
 
+// C.4: hold a block in the arena of THIS library (the engine's own DeviceArena inside the HIP runtime, on
+// the AMD card), then let go.  The CUDA loader holds ITS own arena in ITS runtime, same call, and each side
+// prints only its arena's numbers.  Returns 0 = held; -1 = a null argument or a size disagreement; -2 = the
+// card refused the allocation, out STILL carrying that card's free/total so the refusal can name the card
+// with generate.cpp:164's shape `(N of M MiB VRAM free on this GPU)`.
+typedef int (*strata_hip_arena_hold_fn)(long long bytes, int device, void* out, int expect_size);
+typedef void (*strata_hip_arena_free_fn)();
+
 }
 
 namespace strata::core {
@@ -155,5 +181,13 @@ bool stage_hold_gate(long long bytes, int device);
 // bytes THIS side holds equals the hash the LIBRARY reported over the bytes it wrote.  Refuses (false) with
 // the reason printed when there is no such library, when the stage refused, or when the two hashes disagree.
 bool stage_run_gate(const StrataStageArgs& args);
+
+// C.4's measurement: ONE arena per runtime, not one arena per process.  The host holds its OWN DeviceArena
+// (this process's runtime) and the library holds its OWN inside its HIP runtime through the two entries
+// above; each printed line carries ONLY its arena's asked/held/free-before-after/total, plus the
+// arena_pin_cap_gib() value THAT side read - the WDDM cap is per arena, not per process.  A HIP-only build
+// has no library half and prints "not applicable" there.  false = one arena refused; a refusal names its
+// card with generate.cpp:164's shape `(N of M MiB VRAM free on this GPU)`.
+bool per_runtime_arenas_gate(long long bytes);
 
 }  // namespace strata::core

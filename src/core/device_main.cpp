@@ -41,6 +41,10 @@ int main(int argc, char** argv) {
     std::string stage_pack, stage_native, stage_tokens = "248045,846";
     long long stage_layers = 1, stage_context = 1024;
     int stage_device = 0;
+    // C.4: --list-runtimes also measures ONE ARENA PER RUNTIME: this process's own runtime holds this
+    // many bytes in ITS arena, and the engine library holds the same in ITS arena inside its HIP
+    // runtime (0 = the gate stays off, keep it off only to read the cards alone).
+    long long arena_bytes = 256ll << 20;
 #endif
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
@@ -57,6 +61,7 @@ int main(int argc, char** argv) {
         else if (i + 1 < argc && std::strcmp(argv[i], "--stage-layers") == 0) stage_layers = std::atoll(argv[++i]);
         else if (i + 1 < argc && std::strcmp(argv[i], "--stage-context") == 0) stage_context = std::atoll(argv[++i]);
         else if (i + 1 < argc && std::strcmp(argv[i], "--stage-device") == 0) stage_device = std::atoi(argv[++i]);
+        else if (i + 1 < argc && std::strcmp(argv[i], "--arena-bytes") == 0) arena_bytes = std::atoll(argv[++i]);
 #endif
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("usage: strata-device [--selftest] [--list-devices]\n"
@@ -69,6 +74,9 @@ int main(int argc, char** argv) {
                         "  --stage-hold  hold 256 MiB on hip:0 through that library's ENGINE arena, then read its\n"
                         "                  NaNs back into THIS process's RAM (the layer hand-off's shape)\n");
             std::printf("  --probe-stage  build and run ONE real engine stage INSIDE that library on the AMD card,\n"                        "                  and bring its hand-off payload back into RAM this process owns;\n"                        "                  --stage-pack DIR --stage-native SHARD1 [--stage-layers K]\n"                        "                  [--stage-context N] [--stage-tokens IDS] [--stage-device D]\n");
+            std::printf("  --arena-bytes N  bytes to ask of EACH runtime's OWN arena during --list-runtimes (default\n"
+                        "                  268435456 = 256 MiB; 0 = skip the arenas, read the cards only). Each arena\n"
+                        "                  prints ONLY its own asked/held/free/total and the pin cap read on ITS side\n");
 #endif
 
             return 0;
@@ -151,7 +159,12 @@ int main(int argc, char** argv) {
         std::printf("AMD kernels library: %s\n",
                     strata::core::hip_kernels_ready() ? "present" : "not present next to this engine");
 #endif
-        return 0;
+        // C.4: one arena per runtime, measured after the list: each runtime holds and releases ITS OWN
+        // arena (hip_kernels_loader.cpp's gate), each line carrying ONLY its arena's numbers and the pin
+        // cap read on its side.  Exit 3 = one of the arenas refused: the refusal named its card above, with
+        // that card's free/total (generate.cpp:164's shape).
+        const bool arenas = (arena_bytes > 0) && strata::core::per_runtime_arenas_gate(arena_bytes);
+        return arenas ? 0 : 3;
 #else
         std::fprintf(stderr, "strata-device: --list-runtimes needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
         return 2;

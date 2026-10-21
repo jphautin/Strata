@@ -9,6 +9,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/hip_kernels_abi.hpp"
 #include "strata/core/hip_engine_abi.hpp"
+#include "strata/core/pinned.hpp"   // arena_pin_cap_gib(): C.4 reads the pin cap on THIS side too - the cap is per arena, not per process
 
 #include <cstdio>
 #include <cstring>
@@ -528,6 +529,134 @@ bool stage_run_gate(const StrataStageArgs& args) {
     return ok;
 }
 
+// C.4's measurement: ONE ARENA PER RUNTIME, not one arena per process.  A mixed process has two runtimes up,
+// and today one arena serves only the build's own: this gate makes each runtime hold and release ITS OWN
+// DeviceArena on ITS OWN card - this process's arena on the card its runtime numbers 0 (printed first), and
+// the library's arena inside its HIP runtime through the two arena entries above (printed second) - and each
+// line carries ONLY that arena's asked/held/free-before-after/total, plus the arena_pin_cap_gib() value THAT
+// side read: the WDDM cap (docs/MULTI_GPU.md:340-343) is per arena, so each side's line shows its own, asked
+// BEFORE the hold rather than assumed.  A refusal names its card with that card's numbers, in generate.cpp:164's
+// shape ` (%llu MiB of %llu MiB VRAM free on this GPU)`.  A HIP-only build has no library half: its line says
+// "not applicable", and the gate is then this engine's own arena alone.  true = every arena that applies held
+// and gave the memory back (the release line prints the card free again, on both sides).
+bool per_runtime_arenas_gate(long long bytes) {
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    auto cap_text = [](long long c) -> std::string {
+        if (c == -2) return "auto";
+        if (c == -1) return "unset";
+        if (c == 0) return "the whole arena";
+        return std::to_string(c) + " GiB";
+    };
+    auto card0 = [](DeviceInfo& i) {
+        try {
+            i = device_info(0);
+            return true;
+        } catch (const CudaError&) {
+            i = DeviceInfo{};
+            return false;
+        }
+    };
+
+    // ---- 1. the arena of THIS process's runtime, on the card IT numbers 0
+    DeviceInfo c0{};
+    if (!card0(c0)) {
+        std::fprintf(stderr, "strata: the arenas gate cannot read this runtime's card 0: no arena was measured\n");
+        return false;
+    }
+    const bool hip_here = (c0.runtime == DeviceRuntime::HIP);
+    const char* brand = hip_here ? "hip" : "cuda";
+    const long long cap_here = arena_pin_cap_gib();   // read on THIS side, printed as-is on this line
+    std::unique_ptr<DeviceArena> own;
+    long long held_own = 0;
+    try {
+        own = std::make_unique<DeviceArena>((unsigned long long) bytes, 0, /*poison=*/false);
+        held_own = (long long) own->capacity();
+    } catch (const CudaError&) {
+        own.reset();   // the card refused; the arena does not exist
+    }
+    DeviceInfo c1{};
+    if (!card0(c1)) c1 = c0;
+    if (held_own > 0)
+        std::printf("%s%d (%s) own arena: held, asked %lld B, held %lld B, free %.3f -> %.3f GiB (total %.3f GiB), "
+                    "pin cap read here: %s\n",
+                    brand, 0, c0.name.c_str(), (long long) bytes, held_own,
+                    (double) c0.free_bytes / GiB, (double) c1.free_bytes / GiB,
+                    (double) c0.total_bytes / GiB, cap_text(cap_here).c_str());
+    else
+        std::printf("%s%d (%s) own arena: REFUSED the ask of %lld B (%llu MiB of %llu MiB VRAM free on this GPU), "
+                    "pin cap read here: %s\n",
+                    brand, 0, c0.name.c_str(), (long long) bytes,
+                    (unsigned long long) (c1.free_bytes >> 20), (unsigned long long) (c0.total_bytes >> 20),
+                    cap_text(cap_here).c_str());
+    std::fflush(stdout);
+    own.reset();   // the arena's own destructor gives the card's memory back
+    DeviceInfo c2{};
+    if (!card0(c2)) c2 = c1;
+    std::printf("%s%d own arena released: free back to %.3f GiB (was %.3f while it was held)\n",
+                brand, 0, (double) c2.free_bytes / GiB, (double) c1.free_bytes / GiB);
+    std::fflush(stdout);
+    const bool own_ok = (held_own > 0 && c2.free_bytes > c1.free_bytes);
+
+    // ---- 2. the arena INSIDE the library, on the card ITS HIP runtime numbers 0
+    bool lib_ok = false, lib_na = false;
+    const Eng& L = engine_lib();
+    if (!L.ok) {
+#ifdef STRATA_USE_HIP
+        std::printf("library arena: not applicable (this engine IS the HIP side; the CUDA engine build opens %s)\n",
+                    STRATA_HIP_ENGINE_LIB_NAME);
+        lib_na = true;
+        std::fflush(stdout);
+#else
+        std::fprintf(stderr, "strata: the arenas gate needs %s next to the engine: no library arena in this process\n",
+                     STRATA_HIP_ENGINE_LIB_NAME);
+#endif
+    } else {
+        const auto hold = (strata_hip_arena_hold_fn) sym(L.h, "strata_hip_arena_hold");
+        const auto release = (strata_hip_arena_free_fn) sym(L.h, "strata_hip_arena_free");
+        if (hold == nullptr || release == nullptr) {
+            std::fprintf(stderr, "strata: %s has no arena entries: it cannot hold its own arena inside its HIP runtime\n",
+                         L.path.c_str());
+        } else {
+            StrataArenaReport r{};
+            const int e = hold(bytes, 0, &r, (int) sizeof(StrataArenaReport));
+            if (e == 0 && r.held_bytes > 0) {
+                std::printf("hip%d (%s) library arena: held, asked %lld B, held %lld B, free %.3f -> %.3f GiB "
+                            "(total %.3f GiB), pin cap read THERE: %s\n",
+                            r.device, r.card, (long long) bytes, r.held_bytes,
+                            (double) r.free_before / GiB, (double) r.free_after / GiB,
+                            (double) r.total_bytes / GiB, cap_text(r.cap_gib).c_str());
+                std::fflush(stdout);
+                release();
+                StrataArenaReport again{};
+                const long long small = 64ll << 20;
+                const int e2 = hold(small, 0, &again, (int) sizeof(StrataArenaReport));
+                std::printf("hip%d library arena released: a fresh %lld MiB hold inside the library sees %.3f GiB "
+                            "free (it was %.3f while the arena above was held), code %d\n",
+                            r.device, small >> 20, (double) again.free_before / GiB,
+                            (double) r.free_after / GiB, e2);
+                std::fflush(stdout);
+                if (e2 == 0) release();
+                lib_ok = true;
+            } else if (e == -2) {
+                std::printf("hip%d %s library arena: REFUSED the ask of %lld B (%llu MiB of %llu MiB VRAM free "
+                            "on this GPU), pin cap read THERE: %s, code %d\n",
+                            r.device, r.card[0] ? r.card : "(the card could not be named)", (long long) bytes,
+                            (unsigned long long) (r.free_before >> 20), (unsigned long long) (r.total_bytes >> 20),
+                            cap_text(r.cap_gib).c_str(), e);
+                std::fflush(stdout);
+            } else {
+                std::fprintf(stderr, "strata: the library arena entry refused (%d): no card was named, the blocks "
+                                     "disagree or the device does not exist in that runtime\n", e);
+            }
+        }
+    }
+
+    const bool ok = own_ok && (lib_ok || lib_na);
+    std::fprintf(stderr, "strata: per-runtime arenas gate: %s.  The lines above are what this measured: %s, "
+                         "each arena with its OWN numbers and the pin cap read ON ITS SIDE, never the other's\n",
+                 ok ? "PROVEN" : "NOT PROVEN", lib_na ? "one arena, this engine's runtime only" : "two arenas, one per runtime");
+    return ok;
+}
 
 // ONE process, both brands: this build's own runtime first (upstream's numbering), then the AMD cards the
 // library listed from INSIDE its own runtime.  `device_info` tags each of its own cards with the runtime it

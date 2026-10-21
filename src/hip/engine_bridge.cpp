@@ -15,6 +15,7 @@
 // kernels behind it) really is in the library.  Routing real layers through it is the next step.
 #include "strata/core/hip_engine_abi.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/pinned.hpp"   // arena_pin_cap_gib(): C.4 reads the pin cap INSIDE this library too - the cap is per arena, not per process
 #include "strata/core/layer.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/weights.hpp"
@@ -513,3 +514,47 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_payload(float* dst, int dst_floats
     release_payload();
     return (int) n;
 }
+
+// ================================ C.4: ONE ARENA PER RUNTIME ================================
+//
+// A mixed process has TWO runtimes up, and one arena serves ONE of them: the CUDA engine's DeviceArena
+// belongs to the CUDA runtime, this library's belongs to the HIP runtime. So the library must be able to
+// hold and release a block in ITS own arena on ITS own AMD card, through these entries - the CUDA loader
+// cannot call HIP, so it asks. No poison: this entry measures the arena and the card's memory, not the
+// stage; the stage entry above already proved the allocator and the kernel on this same card.
+//
+// The card is NAMED before the hold (device_summary): a refusal must be able to print which card said
+// no, with that card's free/total - generate.cpp:164's shape ` (%llu MiB of %llu MiB VRAM free on this
+// GPU)`. And cap_gib is what THIS side read: the WDDM cap (docs/MULTI_GPU.md:340-343, STRATA_ARENA_PIN_GIB)
+// is per arena, so each side's line carries its own.
+STRATA_HIP_ENGINE_EXPORT int strata_hip_arena_hold(long long bytes, int device, void* out, int expect_size) {
+    StrataArenaReport* o = (StrataArenaReport*) out;
+    if (o == nullptr || (int) sizeof(StrataArenaReport) != expect_size) return -1;
+    std::memset(o, 0, sizeof(StrataArenaReport));
+    o->bytes = bytes;
+    o->device = device;
+    o->cap_gib = strata::core::arena_pin_cap_gib();   // read INSIDE this library, printed as-is
+    size_t total = 0;
+    if (hipSetDevice(device) != hipSuccess) return -2;   // this runtime has no such device
+    std::string name, detail;
+    if (strata::core::device_summary(device, name, detail))   // named BEFORE the hold, so a refusal can name it
+        std::snprintf(o->card, sizeof(o->card), "%s", name.c_str());
+    if (hipMemGetInfo(&o->free_before, &total) == hipSuccess) o->total_bytes = (unsigned long long) total;
+    try {
+        g_arena = std::make_unique<strata::core::DeviceArena>((uint64_t) bytes, device, /*poison=*/false);
+        o->arena_ok = 1;
+        o->held_bytes = g_arena->capacity();
+    } catch (const strata::core::CudaError&) {
+        hipMemGetInfo(&o->free_after, &total);   // the refusal still carries this card's numbers
+        return -2;
+    } catch (const std::exception&) {
+        hipMemGetInfo(&o->free_after, &total);
+        return -2;
+    }
+    hipMemGetInfo(&o->free_after, &total);
+    return 0;
+}
+
+// Let go: the arena's own destructor gives the card's memory back - what is measured is then the card again,
+// so "held" cannot be silent, same rule as strata_hip_stage_free above.
+STRATA_HIP_ENGINE_EXPORT void strata_hip_arena_free() { g_arena.reset(); }
