@@ -558,3 +558,92 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_arena_hold(long long bytes, int device, 
 // Let go: the arena's own destructor gives the card's memory back - what is measured is then the card again,
 // so "held" cannot be silent, same rule as strata_hip_stage_free above.
 STRATA_HIP_ENGINE_EXPORT void strata_hip_arena_free() { g_arena.reset(); }
+
+// CODE.md C.5: hash the named expert pairs INSIDE this library - the library's OWN expert tier on the AMD
+// card, filled from the pack by the library's OWN objects.  Nothing of the caller's RAM arena is read here:
+// the CUDA host named these pairs BEFORE its own side existed, and this library's copy of the layout stays
+// the FULL one (the drop is applied to the host's copy only - experts.bin keeps its own layout, `file_total`).
+// Each slot's bytes come back through this runtime's hipMemcpy and are hashed in this library, so the number
+// can only be the AMD tier's - the host compares it against its RAM arena (present pairs) and against what
+// it fetched from the NVIDIA tier (dropped pairs).
+STRATA_HIP_ENGINE_EXPORT int strata_hip_expert_hash(const void* args, int args_size, void* out, int out_size) {
+    const StrataExpertPairs* a = (const StrataExpertPairs*) args;
+    StrataExpertOut* o = (StrataExpertOut*) out;
+    if (a == nullptr || (int) sizeof(StrataExpertPairs) != args_size || o == nullptr ||
+        (int) sizeof(StrataExpertOut) != out_size) return -1;
+    std::memset(o, 0, sizeof(StrataExpertOut));
+    const char* arch = strata::core::compiled_gpu_archs();
+    std::snprintf(o->archs, sizeof o->archs, "%s", arch ? arch : "");
+    o->n_pairs = a->n_pairs;
+    if (a->n_pairs <= 0 || a->n_pairs > 32) {
+        std::snprintf(o->err, sizeof o->err, "expert hash: asked for %d pairs, 1..32 possible", a->n_pairs);
+        return -100;
+    }
+    std::string err;
+    if (!strata::kernels::cpu::expert_layout_load(a->pack, a->n_layers, a->n_expert, err)) {
+        std::snprintf(o->err, sizeof o->err, "%s", err.c_str());
+        return -100;
+    }
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    o->n_layers = (long long) lay.n_layers;
+    o->n_expert = (long long) lay.n_expert;
+    if (hipSetDevice(a->device) != hipSuccess) {
+        std::snprintf(o->err, sizeof o->err, "this runtime has no such AMD card: %d", a->device);
+        return -100;
+    }
+    std::string name, detail;
+    if (strata::core::device_summary(a->device, name, detail))   // named BEFORE anything took the card
+        std::snprintf(o->card, sizeof o->card, "%s", name.c_str());
+    size_t total = 0;
+    hipMemGetInfo(&o->free_before, &total);
+
+    {   // the tier's whole life: free/after is read with the card given back
+        strata::core::ExpertCache cache;
+        if (!cache.open(a->n_pairs, lay.n_layers, lay.n_expert, (int64_t) lay.max_blob, err)) {
+            std::snprintf(o->err, sizeof o->err, "%s", err.c_str());
+            return -100;
+        }
+        o->cache_bytes = cache.bytes();
+        strata::core::FileExpertSource src;
+        src.set_gguf(a->native);
+        if (!src.open(a->pack, lay.n_layers, lay.n_expert, err)) {
+            std::snprintf(o->err, sizeof o->err, "%s", err.c_str());
+            return -100;
+        }
+        std::vector<uint8_t> back;
+        const long long f0 = now_ms();
+        for (int i = 0; i < a->n_pairs; ++i) {
+            const int32_t l = a->pairs[2 * i], e = a->pairs[2 * i + 1];
+            const int32_t slot = cache.admit(l, e);
+            if (slot == strata::core::kNotResident) {
+                std::snprintf(o->err, sizeof o->err, "the tier refused expert (%d, %d)", l, e);
+                return -100;
+            }
+            const uint8_t* b = src.blob_stable(l, e);
+            if (b == nullptr) {
+                std::snprintf(o->err, sizeof o->err, "the pack does not hold expert (%d, %d)", l, e);
+                return -100;
+            }
+            const long long bb = (long long) lay.blob_bytes(l);
+            if (!cache.fill_slot_blocking(slot, b, err, bb) || !cache.verify_slot(slot, b, err, bb)) {
+                std::snprintf(o->err, sizeof o->err, "%s", err.c_str());
+                return -100;
+            }
+            o->blob_bytes[i] = bb;
+            back.assign((size_t) bb, 0);
+            if (hipMemcpy(back.data(), cache.device_slot(slot), (size_t) bb, hipMemcpyDeviceToHost) != hipSuccess) {
+                std::snprintf(o->err, sizeof o->err, "the slot would not come back from the card");
+                return -100;
+            }
+            // NOT the bridge's local fnv1a64 above: that one multiplies by 10995116277794481 and seeds
+            // 1469598125565353939 (it is the STAGE parity's pair - the loader's local lambda matches it).
+            // The C.5 sites on the loader hash with pinned.hpp's fnv1a64 (seed 1469598103934665603, times
+            // 1099511628211): the SAME hash FUNCTION is the claim here, so THIS library calls THAT function.
+            o->hash[i] = strata::core::fnv1a64(back.data(), back.size());
+        }
+        o->fill_s = (double) (now_ms() - f0) / 1000.0;
+    }
+    hipMemGetInfo(&o->free_after, &total);
+    o->ran = 1;
+    return 0;
+}

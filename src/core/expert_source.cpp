@@ -4417,6 +4417,12 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     auto dst_blob = [&lay, pad](int64_t l, int64_t e) -> uint64_t {
         return pad != nullptr ? pad->blob_off(l, e) : lay.blob_offset(l, e);
     };
+    // CODE.md C.5 (remote drop): a held expert has a HOLE in the arena (pos = -1): the shard span is still
+    // read (the GGUF layout does not change and the reads stay chunked) but the copy skips the hole, so the
+    // only bytes that land in `dst` are the present pairs' - `st.bytes` then matches the holed `total`.
+    auto in_ram = [&lay](int64_t l, int64_t e) {
+        return lay.pos.empty() || lay.pos[(size_t) (l * lay.n_expert + e)] >= 0;
+    };
     // `ready`: layer l is written only once *ready > l + 1 (a PinnedArena registering its slices meanwhile; the next
     // slice too, since its registration starts on the page that may hold this layer's tail)
     auto wait_ready = [ready](int64_t l) {
@@ -4493,7 +4499,8 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                         const uint8_t* q = buf + (src + done - a0);
                         for (uint64_t k = 0; k < n / per[r]; ++k) {
                             const uint64_t e = done / per[r] + k;
-                            std::memcpy(dst + dst_blob(l, (int64_t) e) + at[r], q + k * per[r], (size_t) per[r]);
+                            if (in_ram(l, (int64_t) e))
+                                std::memcpy(dst + dst_blob(l, (int64_t) e) + at[r], q + k * per[r], (size_t) per[r]);
                         }
                     }
                 }
@@ -4557,7 +4564,8 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                     if (std::fread(buf.data(), 1, (size_t) n, f) != (size_t) n) { bad = true; return; }
                     for (uint64_t k = 0; k < n / per[r]; ++k) {
                         const uint64_t e = done / per[r] + k;
-                        std::memcpy(dst + dst_blob(l, (int64_t) e) + at[r], buf.data() + k * per[r], (size_t) per[r]);
+                        if (in_ram(l, (int64_t) e))
+                            std::memcpy(dst + dst_blob(l, (int64_t) e) + at[r], buf.data() + k * per[r], (size_t) per[r]);
                     }
                 }
             }
@@ -4593,9 +4601,17 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     }
     const int64_t blob = (int64_t) lay.max_blob;
     const uint64_t want = lay.total;
+    // CODE.md C.5 (remote drop): with a drop applied, `total` is the RAM arena's holed size and experts.bin
+    // keeps its own full layout (`file_total`): allocation, RAM check and loaders use the holed one, the
+    // size check against the file compares the file's.
+    const bool dropped = !lay.pos.empty();
+    const uint64_t file_want = dropped ? lay.file_total : want;
 
     // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
     const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
+    // CODE.md C.5: a drop holes the ARENA, whatever the experts come from.  experts.bin: load_experts_holed
+    // reads around them (below).  The GGUF path: load_experts_gguf's copies ask present() per expert and
+    // skip the held ones - the shards keep their own layout, only the arena is holey.
     // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend
     // 34 GB and a minute of loading first.
     if (from_gguf) {
@@ -4607,7 +4623,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::ifstream f(path, std::ios::binary | std::ios::ate);
         if (!f) { err = "ArenaExpertSource: cannot open " + path; return false; }
         const uint64_t got = (uint64_t) f.tellg();
-        if (got != want && got != want + (uint64_t) blob) {   // + one blob: STRATA_ARENA_MMAP's padded file
+        if (got != file_want && got != file_want + (uint64_t) blob) {   // + one blob: STRATA_ARENA_MMAP's padded file
             char buf[400];
             std::snprintf(buf, sizeof buf,
                           "ArenaExpertSource: %s is %llu B but %lld layers x %lld experts (blobs up to %lld B) "
@@ -4630,7 +4646,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 #else
     static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
     if (arena_mmap) {
-        const uint64_t file_bytes = want + (uint64_t) blob;
+        if (dropped) {   // CODE.md C.5: a mapped arena IS experts.bin: no room for holes
+            err = "ArenaExpertSource: the mapped arena (STRATA_ARENA_MMAP) keeps experts.bin's layout: a remote drop has nowhere to put its holes";
+            return false;
+        }
+        const uint64_t file_bytes = file_want + (uint64_t) blob;
         uint64_t have = 0;
         {
             std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -4710,6 +4730,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // writes experts.bin from the arena).  The file offsets (loff) stay packed; only the destination moves.
     padded_ = false;
     pad_ = PadMap{};
+    if (pin_by_need_ && !pin_pairs_.empty() && dropped) {   // CODE.md C.5: the pad map would re-pack the arena, holes and all
+        err = "ArenaExpertSource: pin by need over a dropped arena is not wired (the pad map re-packs, erasing the holes)";
+        return false;
+    }
     if (pin_by_need_ && !pin_pairs_.empty() && !arena_mmap && shared_arena_file.empty()) {   // (a shared arena file has one layout for every process: the packed one)
         padded_ = true;
         uint64_t at = 0;
@@ -4809,6 +4833,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     const std::atomic<int>* rp = deferred ? &ready : nullptr;
     if (from_gguf) {
         st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp, padded_ ? &pad_ : nullptr);
+    } else if (dropped) {
+        // CODE.md C.5: with holes the per-layer spans direct/ranges want are broken - read experts.bin expert by
+        // expert, held pairs skipped (the helper card's `reader` filled THEIR tier before this arena existed).
+        st = load_experts_holed(path, a->data(), lay, std::max(threads, 8), rp);
     } else {
         if (unbuffered && !padded_) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
         if (!unbuffered || padded_ || (!st.ok && st.error.empty()))   // unaligned ranges / the padded layout: the buffered reader
@@ -4981,12 +5009,14 @@ bool ArenaExpertSource::pcie_layer(int64_t layer) const {
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    if (!strata::kernels::cpu::expert_layout().present(layer, expert)) return false;   // CODE.md C.5: no RAM bytes to pin
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (ranges_) return pin_range_of(arena_off(layer, expert), lay.blob_bytes(layer)) >= 0;   // the whole blob inside ONE registered range
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
+    if (!strata::kernels::cpu::expert_layout().present(layer, expert)) return nullptr;   // CODE.md C.5: the hole has no alias
     if (ranges_) {   // pin by need: the range's device base + the blob's offset inside it
         if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
         const auto& rl = strata::kernels::cpu::expert_layout();
@@ -5004,6 +5034,8 @@ const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) co
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (base_ == nullptr) return nullptr;
+    // CODE.md C.5: a dropped pair has no RAM bytes - nothing anywhere may read them from here
+    if (!strata::kernels::cpu::expert_layout().present(layer, expert)) return nullptr;
     if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
@@ -5015,9 +5047,30 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
 
 const uint8_t* ArenaExpertSource::blob_at(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
+    if (!strata::kernels::cpu::expert_layout().present(layer, expert)) return nullptr;   // CODE.md C.5: the hole
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
     return base_ + arena_off(layer, expert);   // (the padded layout of pin by need too)
+}
+
+// CODE.md C.5 (remote drop): the pair the RAM arena does NOT hold is transient for this source - its bytes
+// live in the helper tier's VRAM, and the prompt path's stager copies them through aux_fetch (the driver
+// wired it to RemoteExperts::fetch).  A present pair keeps today's answer: the blob is a stable RAM pointer.
+bool ArenaExpertSource::transient(int64_t layer, int64_t expert) const {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (layer < 0 || layer >= lay.n_layers || expert < 0 || expert >= lay.n_expert) return false;
+    return !lay.present(layer, expert);
+}
+
+bool ArenaExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (dst == nullptr) return false;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (base_ != nullptr && lay.present(layer, expert)) {   // RAM has them: a straight copy out of the arena
+        std::memcpy(dst, base_ + arena_off(layer, expert), (size_t) lay.blob_bytes(layer));
+        return true;
+    }
+    if (!aux_fetch) return false;   // dropped and nobody set the hook: no one has these bytes
+    return aux_fetch(layer, expert, dst);
 }
 
 }  // namespace strata::core

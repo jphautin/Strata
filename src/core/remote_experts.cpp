@@ -95,6 +95,62 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     return true;
 }
 
+// CODE.md C.5 piece (c): a dropped expert has NO RAM copy - its bytes live in this tier's VRAM. The prompt
+// path and the CPU pool ask for them HERE: one D2H from the slot into a host buffer the caller owns. The
+// bytes are the ones open() filled from the same source, so a hash taken here and one taken on either GPU's
+// tier are the same measurement, not a copy of the same buffer.
+bool RemoteExperts::fetch(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (device_ < 0 || dst == nullptr) {
+        std::fprintf(stderr, "strata: fetch (%lld, %lld): no tier on any card (device_=%d)\n", layer, expert, device_);
+        return false;
+    }
+    const int32_t slot = cache_.slot_of(layer, expert);
+    if (slot < 0) {
+        std::fprintf(stderr, "strata: fetch (%lld, %lld): this tier does not hold the pair (slot %d)\n", layer, expert, slot);
+        return false;
+    }
+    DeviceScope scope(device_);
+    if (!scope.ok) {
+        std::fprintf(stderr, "strata: fetch (%lld, %lld): cannot enter the tier's device %d: %s\n", layer, expert,
+                     device_, scope.error(device_).c_str());
+        return false;
+    }
+    const size_t n = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+    const size_t cap = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+    if (!h_fetch_ || n > cap || n > fetch_cap_) {
+        std::fprintf(stderr, "strata: fetch (%lld, %lld) slot %d: no staging for %lld B (cap %lld)\n", layer, expert,
+                     slot, (long long) n, (long long) fetch_cap_);
+        return false;
+    }
+    // Diagnostics: a sticky error from earlier in the mixed process would be RETURNED by the very next CUDA
+    // call without any call of ours actually failing. Clear and name it before copying.
+    if (const cudaError_t sticky = cudaGetLastError(); sticky != cudaSuccess) {
+        std::fprintf(stderr, "strata: fetch note: a sticky CUDA error was already set before the copy: %s\n",
+                     cudaGetErrorString(sticky));
+    }
+    // Pass 10 crashed with an access violation (exit 0xC0000005) on a direct host read of the slot: the small
+    // device `RemoteMeta` is host-visible under WDDM2 but the 0.986 GiB cudaMalloc arena is NOT, so the fetch
+    // must go through the runtime. Staged copy into the pinned staging reserved at open(): a fresh
+    // cudaMemcpy wanted its own pinned pool (refused), and the enqueue needs only a small launch record.
+    const cudaError_t e = cudaMemcpyAsync(h_fetch_, cache_.device_slot(slot), n, cudaMemcpyDeviceToHost, read_stream_);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "strata: fetch (%lld, %lld) slot %d, %lld B D2H ENQUEUE refused: %s\n", layer, expert,
+                     slot, (long long) n, cudaGetErrorString(e));
+        return false;
+    }
+    const cudaError_t s = cudaStreamSynchronize(read_stream_);
+    if (s != cudaSuccess) {
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        std::fprintf(stderr, "strata: fetch (%lld, %lld) slot %d, %lld B D2H: enqueue ok, the queued work said "
+                             "%s (%.3f GiB free on the tier card)\n",
+                     layer, expert, slot, (long long) n, cudaGetErrorString(s), (double) fb / 1073741824.0);
+        return false;
+    }
+    std::memcpy(dst, h_fetch_, n);
+    return true;
+}
+
 void RemoteExperts::close() {
     if (device_ < 0) return;
     DeviceScope scope(device_);
@@ -111,6 +167,7 @@ void RemoteExperts::close() {
         if (h_x_) cudaFreeHost(h_x_);
         if (h_out_) cudaFreeHost(h_out_);
         if (h_meta_) cudaFreeHost(h_meta_);
+        if (h_fetch_) cudaFreeHost(h_fetch_);
         if (stream_) cudaStreamDestroy(stream_);
         if (read_stream_) cudaStreamDestroy(read_stream_);
     }
@@ -131,8 +188,16 @@ void RemoteExperts::close() {
 bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          const std::vector<std::pair<int32_t, int32_t>>& ranked,
                          const ExpertCache& primary, ExpertSource& source,
-                         std::vector<uint8_t>& claimed, std::string& err, bool auto_size) {
+                         std::vector<uint8_t>& claimed, std::string& err, bool auto_size,
+                         const std::function<const uint8_t*(int32_t, int32_t)>& reader) {
     close();
+    // CODE.md C.5 piece (a): when a `reader` is given, the blobs come from IT (experts.bin, read expert by
+    // expert BEFORE the RAM arena exists) - the arena is about to be re-laid WITHOUT exactly these pairs, so
+    // `source.blob()` will answer null for them and cannot feed this tier. Without a reader: today's path,
+    // unchanged, byte for byte.
+    auto blob_of = [&](int32_t l, int32_t e) -> const uint8_t* {
+        return reader ? reader(l, e) : source.blob(l, e);
+    };
     int count = 0;
     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
     if (device < 0 || device >= count || slots <= 0 || ranked.empty() ||
@@ -185,7 +250,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     if (!cache_ok) { err = "CUDA" + std::to_string(device) + " experts: " + err; close(); return false; }
     for (const auto& pair : selected) {
         const int32_t slot = cache_.admit(pair.first, pair.second);
-        const uint8_t* blob = source.blob(pair.first, pair.second);
+        const uint8_t* blob = blob_of(pair.first, pair.second);
         if (slot < 0 || !blob || !cache_.fill_slot_blocking(slot, blob, err, (int64_t) lay.blob_bytes(pair.first))) {
             err = "CUDA" + std::to_string(device) + " experts: " +
                   (err.empty() ? "cache fill failed" : err);
@@ -193,7 +258,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         }
     }
     const auto& first = selected.front();
-    if (!cache_.verify_slot(cache_.slot_of(first.first, first.second), source.blob(first.first, first.second),
+    if (!cache_.verify_slot(cache_.slot_of(first.first, first.second), blob_of(first.first, first.second),
                             err, (int64_t) lay.blob_bytes(first.first))) {
         err = "CUDA" + std::to_string(device) + " experts: " + err;
         close(); return false;
@@ -208,6 +273,10 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         check(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err, device) &&
         check(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err, device) &&
         check(cudaHostAlloc(&h_meta_, meta_bytes, cudaHostAllocPortable), "metadata staging", err, device) &&
+        // C.5: the fetch-back D2H runs AFTER the RAM arena is committed, and under that pressure the runtime
+        // can no longer satisfy a pinned staging allocation of its own (CUDA calls that "out of memory").
+        // Reserve the staging HERE, while the arena is still light, sized to the pack's biggest blob.
+        check(cudaHostAlloc((void**) &h_fetch_, (size_t) lay.max_blob, cudaHostAllocPortable), "fetch staging", err, device) &&
         check(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err, device) &&
         check(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err, device) &&
         check(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activation", err, device) &&
@@ -215,6 +284,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         check(cudaMalloc(&d_scratch_, scratch), "scratch", err, device) &&
         check(cudaMalloc(&d_meta_, meta_bytes), "group metadata", err, device);
     if (!allocated) { close(); return false; }
+    fetch_cap_ = h_fetch_ ? (size_t) lay.max_blob : 0;
     if (!check(cudaStreamCreateWithFlags(&read_stream_, cudaStreamNonBlocking), "cache read stream", err, device)) {
         close();
         return false;

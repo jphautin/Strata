@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "strata/kernels/cpu/expert_layout.hpp"
+
 namespace strata::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
@@ -152,6 +154,14 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
                               const std::atomic<int>* ready = nullptr);
+
+/// CODE.md C.5 (remote drop): experts.bin read into the arena WITH HOLES - the pairs a helper card holds
+/// (`pos[]` = -1) are skipped, every other expert is read at its OWN offset in experts.bin (`file_blob_offset`),
+/// which a drop never changes. Per-expert buffered reads: a hole breaks the per-layer spans direct wants.
+/// `lay` must already carry a drop (`pos` non-empty); false (empty error) otherwise.
+LoadStats load_experts_holed(const std::string& path, uint8_t* dst,
+                             const strata::kernels::cpu::ExpertLayout& lay, int threads,
+                             const std::atomic<int>* ready = nullptr);
 
 /// Whether the expert files are better read unbuffered (Windows; false elsewhere): a timed probe of random 64 KiB
 /// reads says they are not in the OS file cache (a cached read takes ~10 us, the drive ~80), and the RAM left

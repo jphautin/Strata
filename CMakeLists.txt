@@ -359,7 +359,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
 
   add_executable(strata-device src/core/device_main.cpp)
-  target_link_libraries(strata-device PRIVATE strata_core)
+  # C.5: --probe-expert reaches the expert machinery (ArenaExpertSource, RemoteExperts, ExpertCache,
+  # the layout), which lives in strata_engine (and strata_kernels_cpu for the layout): the exe that
+  # asks one expert tier across the join must carry those objects itself.
+  target_link_libraries(strata-device PRIVATE strata_core strata_engine)
 
   add_executable(strata-load src/core/load_main.cpp)
   target_link_libraries(strata-load PRIVATE strata_core strata_kernels)

@@ -30,16 +30,42 @@ struct ExpertLayout {
     std::vector<std::string> gguf_file;
     int version = 0;                      ///< native_experts.txt's header version (0 = none given)
     uint64_t max_blob = BLOB;
-    uint64_t total = 0;                   ///< experts.bin size
+    uint64_t total = 0;                   ///< experts.bin size (after a drop: the RAM arena's size)
+
+    /// Remote drop (CODE.md C.5): `pos[layer * n_expert + expert]` is the expert's index inside its layer IN THE
+    /// RAM ARENA, -1 when a helper card holds it and RAM does not.  Empty = every expert present (the default,
+    /// byte-for-byte the layout nothing is dropped).  `file_offset` / `file_total` keep experts.bin's OWN layout,
+    /// which a drop does not change.
+    std::vector<int32_t> pos;
+    std::vector<uint64_t> file_offset;
+    uint64_t file_total = 0;
 
     uint64_t blob_bytes(int64_t layer) const { return native ? bytes[(size_t) layer] : (uint64_t) BLOB; }
     uint64_t layer_offset(int64_t layer) const {
         return native ? offset[(size_t) layer] : (uint64_t) layer * (uint64_t) n_expert * (uint64_t) BLOB;
     }
+    /// The single "is this expert in RAM?" gate (CODE.md C.5): everything that touches an expert blob - the
+    /// arena, the VRAM tiers, the prompt path, the CPU pool - asks it, so a dropped expert cannot be read from
+    /// RAM by accident anywhere.
+    bool present(int64_t layer, int64_t expert) const {
+        return pos.empty() || pos[(size_t) (layer * n_expert + expert)] >= 0;
+    }
+    /// Offset in the RAM arena (only meaningful when `present`).
     uint64_t blob_offset(int64_t layer, int64_t expert) const {
-        return layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
+        const int64_t i = pos.empty() ? expert : (int64_t) pos[(size_t) (layer * n_expert + expert)];
+        return layer_offset(layer) + (uint64_t) i * blob_bytes(layer);
+    }
+    /// Offset in experts.bin, whatever was dropped (the file keeps its full layout).
+    uint64_t file_blob_offset(int64_t layer, int64_t expert) const {
+        if (file_offset.empty()) return layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
+        return file_offset[(size_t) layer] + (uint64_t) expert * blob_bytes(layer);
     }
 };
+
+/// Remote drop (CODE.md C.5): re-lays the arena without the experts `drop` marks (n_layers x n_expert, 1 = a
+/// helper card holds it and RAM does not).  A native pack only.  Afterwards blob_offset() is the holed RAM
+/// layout and file_blob_offset() is experts.bin's.  False with `err` when it cannot apply.
+bool expert_layout_drop(const std::vector<uint8_t>& drop, std::string& err);
 
 /// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, VNNI, VBMI).  Probed in a
 /// file compiled without AVX-512, so asking is safe everywhere; STRATA_FORCE_AVX2=1 answers no (for tests).

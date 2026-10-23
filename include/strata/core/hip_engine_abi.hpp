@@ -13,7 +13,7 @@
 
 #include <string>
 
-#define STRATA_HIP_ENGINE_ABI_VERSION 3   // 3 = plus the per-runtime arena entries (C.4); a version-2 or 1 library refuses
+#define STRATA_HIP_ENGINE_ABI_VERSION 4   // 4 = plus the expert-tier hash entry (C.5); a version-3, 2 or 1 library refuses
 
 #if defined(_WIN32)
 #define STRATA_HIP_ENGINE_LIB_NAME "strata_hip_engine.dll"
@@ -63,6 +63,36 @@ struct StrataArenaReport {
     unsigned long long free_before = 0;      // that card's free VRAM before the hold
     unsigned long long free_after = 0;       // and after (0 = the hold never happened)
     unsigned long long total_bytes = 0;      // the card's total, for the print
+};
+
+// C.5: the expert bytes ONE hash may ask about, as plain data.  The CUDA host named these pairs BEFORE it
+// built its own holed RAM arena and NVIDIA tier, so the library cannot pick the easy ones: the list carries
+// dropped and present pairs on purpose.  `native` is empty when the pack carries experts.bin.
+struct StrataExpertPairs {
+    char pack[256];
+    char native[512];
+    long long n_layers, n_expert;  // the geometry the CALLER read from the model's metadata: the library's layout load must agree
+    int32_t pairs[64];       // (layer, expert) pairs, flat; up to 32 of them
+    int n_pairs;
+    int device;              // the AMD ordinal INSIDE the library's own HIP runtime
+};
+
+// What the library measured, as numbers only: each pair's FNV-1a over the bytes ITS OWN expert tier held
+// (filled from experts.bin inside the library, on the AMD card), that card's name and free/total, and the
+// cache's size.  The host compares these hashes against its RAM arena's bytes (present pairs) and against
+// what it fetched back from the NVIDIA tier (dropped pairs): the SAME expert bytes, hashed at three sites.
+struct StrataExpertOut {
+    char archs[64];                  // the arches this library's device code holds
+    char card[48];                   // the AMD card it ran on, by name
+    char err[256];                   // what refused, in the library's own words (empty = it ran)
+    int ran;                         // 1 = the tier was built and EVERY named pair hashed
+    int n_pairs;                     // pairs hashed back (the caller's n, echoed)
+    unsigned long long hash[32];     // FNV-1a per pair, over the slot's bytes read back from the card
+    long long blob_bytes[32];        // each pair's byte count, so the host can size its own compare
+    long long cache_bytes;           // the library's ExpertCache::bytes()
+    long long n_layers, n_expert;    // the layout the library loaded for the pack
+    unsigned long long free_before, free_after;   // the card's free VRAM around the tier
+    double fill_s;                   // the tier's fill, from experts.bin
 };
 
 // ================================ C.1: ONE REAL ENGINE STAGE, INSIDE THIS LIBRARY ================================
@@ -167,6 +197,13 @@ typedef int (*strata_hip_stage_payload_fn)(float* dst, int dst_floats);
 typedef int (*strata_hip_arena_hold_fn)(long long bytes, int device, void* out, int expect_size);
 typedef void (*strata_hip_arena_free_fn)();
 
+// C.5: hash the named expert pairs INSIDE this library - its own expert tier on the AMD card, filled from
+// experts.bin by the library's own objects, nothing of the caller's read here.  Same block rule as the
+// stage entry: each side carries its own sizeof and the library refuses before touching either on a drift.
+// Return: 0 = every pair hashed into out; -1 = null argument or size disagreement; -100 = the library
+// refused (out's err names why).
+typedef int (*strata_hip_expert_hash_fn)(const void* args, int args_size, void* out, int out_size);
+
 }
 
 namespace strata::core {
@@ -189,5 +226,13 @@ bool stage_run_gate(const StrataStageArgs& args);
 // has no library half and prints "not applicable" there.  false = one arena refused; a refusal names its
 // card with generate.cpp:164's shape `(N of M MiB VRAM free on this GPU)`.
 bool per_runtime_arenas_gate(long long bytes);
+
+// C.5's measurement, taken on the engine's side: the NVIDIA tier filled from experts.bin BEFORE the RAM
+// arena exists (its own `reader`), the RAM arena re-laid WITHOUT the pairs that tier holds (its holed load
+// lines), the dropped pairs fetched back into this process's RAM and hashed HERE, and the library's own
+// AMD tier hashing the SAME pairs - one number at three sites.  false = one site refused or the hashes
+// disagree; every printed line carries only the numbers of the side that measured it.
+bool expert_tier_gate(const std::string& pack, const std::string& native, const std::string& profile,
+                      long long layers, long long experts, int tier_pairs, int helper_device);
 
 }  // namespace strata::core

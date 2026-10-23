@@ -10,6 +10,10 @@
 #include "strata/core/hip_kernels_abi.hpp"
 #include "strata/core/hip_engine_abi.hpp"
 #include "strata/core/pinned.hpp"   // arena_pin_cap_gib(): C.4 reads the pin cap on THIS side too - the cap is per arena, not per process
+#include "strata/core/expert_cache.hpp"   // read_expert_profile: C.5 ranks the pairs the helper tier takes
+#include "strata/core/expert_source.hpp"  // ArenaExpertSource: the RAM arena re-laid WITH holes
+#include "strata/core/remote_experts.hpp" // RemoteExperts: the helper tier, filled from experts.bin by a reader
+#include "strata/kernels/cpu/expert_layout.hpp"   // present(), expert_layout_drop: the single RAM gate
 
 #include <cstdio>
 #include <cstring>
@@ -17,6 +21,11 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <map>
+#include <utility>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -656,6 +665,230 @@ bool per_runtime_arenas_gate(long long bytes) {
                          "each arena with its OWN numbers and the pin cap read ON ITS SIDE, never the other's\n",
                  ok ? "PROVEN" : "NOT PROVEN", lib_na ? "one arena, this engine's runtime only" : "two arenas, one per runtime");
     return ok;
+}
+
+// CODE.md C.5: the expert tiers across the join, one byte-stream at THREE sites.  The helper tier (NVIDIA,
+// CUDA's own runtime here) is filled from experts.bin through a `reader` BEFORE the RAM arena exists - its
+// blobs cannot come from the arena, the arena is about to be re-laid WITHOUT exactly these pairs.  The RAM
+// arena (this process) gets holes at those pairs and loads the rest from experts.bin.  Dropped pairs come
+// BACK through RemoteExperts::fetch, wired to the arena's aux_fetch.  The library's OWN expert tier (AMD,
+// inside its HIP runtime, filled from experts.bin by its own objects) hashes the SAME named pairs: three
+// FNV-1a numbers per pair - RAM arena (present), NVIDIA tier fetched back (dropped), AMD tier in the
+// library (both).  Every line carries only the numbers of the side that measured it.
+bool expert_tier_gate(const std::string& pack, const std::string& native, const std::string& profile_path,
+                      long long layers, long long experts, int tier_pairs, int helper_device) {
+    const double GiB = 1024.0 * 1024.0 * 1024.0;
+    std::string err;
+
+    // In a mixed process the primary session runs INSIDE the HIP library, on the AMD card: a card of the
+    // CUDA runtime here is a helper.  Left at its default (ordinal 0), the helper-cannot-be-primary rule
+    // would refuse this rig's only CUDA card - the default describes the CUDA-only world, not this one.
+    set_primary_device(-1);
+
+    if (!strata::kernels::cpu::expert_layout_load(pack, layers, experts, err)) {
+        std::fprintf(stderr, "strata: expert tier gate: the pack's layout refused: %s\n", err.c_str());
+        return false;
+    }
+    auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native) {
+        std::fprintf(stderr, "strata: expert tier gate: a holed RAM arena needs a native pack (per-layer blobs): %s\n",
+                     pack.c_str());
+        return false;
+    }
+
+    // ---- 1. the helper tier, BEFORE the arena: experts.bin read pair by pair (piece (a))
+    std::vector<std::pair<int32_t, int32_t>> ranked;
+    int64_t pslots = 0;
+    if (!read_expert_profile(profile_path, lay.n_layers, lay.n_expert, ranked, pslots, err)) {
+        std::fprintf(stderr, "strata: expert tier gate: the profile refused: %s\n", err.c_str());
+        return false;
+    }
+    double free_gib = 0.0;
+    if (!RemoteExperts::preflight(helper_device, free_gib, err)) {
+        std::fprintf(stderr, "strata: expert tier gate: helper preflight refused: %s\n", err.c_str());
+        return false;
+    }
+    DeviceInfo hd{};
+    try { hd = device_info(helper_device); } catch (const CudaError&) { hd = DeviceInfo{}; }
+    // The tier's `reader`: expert by expert from the PACK, BEFORE the RAM arena exists.  This rig's pack
+    // is a native GGUF one (no experts.bin - native_experts.txt names the tensors in the shards), so its
+    // own FileExpertSource is what the reader reads through; a pack with experts.bin is the same reader
+    // over that file.  Either way: these bytes come from the PACK, never from the arena to be.
+    FileExpertSource tier_file;
+    tier_file.set_gguf(native);
+    if (!tier_file.open(pack, lay.n_layers, lay.n_expert, err)) {
+        std::fprintf(stderr, "strata: expert tier gate: the pack's expert file refused: %s\n", err.c_str());
+        return false;
+    }
+    // the reader's OWN buffers: verify_slot re-reads the first pair's bytes AFTER the fill loop, so
+    // nothing may recycle them (the arena's own bytes do not exist for these pairs at all)
+    std::map<std::pair<int32_t, int32_t>, std::vector<uint8_t>> held;
+    auto reader = [&](int32_t l, int32_t e) -> const uint8_t* {
+        const auto key = std::make_pair(l, e);
+        const auto it = held.find(key);
+        if (it != held.end()) return it->second.data();
+        const uint8_t* b = tier_file.blob_stable(l, e);
+        if (b == nullptr) return nullptr;
+        std::vector<uint8_t> v(b, b + (size_t) lay.blob_bytes(l));
+        return (held.emplace(key, std::move(v)).first)->second.data();
+    };
+    RemoteExperts helpers;
+    std::vector<uint8_t> claimed((size_t) lay.n_layers * lay.n_expert, 0);
+    ExpertCache no_primary;      // the real primary tier is the LIBRARY's, on the AMD card: nothing here owns it
+    FileExpertSource no_source;  // left closed: a set `reader` is where these pairs' blobs come from
+    if (!helpers.open(helper_device, tier_pairs, lay.n_layers, lay.n_expert, ranked,
+                      no_primary, no_source, claimed, err, /*auto_size=*/false, reader)) {
+        std::fprintf(stderr, "strata: expert tier gate: cuda%d tier refused: %s\n", helper_device, err.c_str());
+        return false;
+    }
+    long long tier_count = 0;
+    double tier_bytes = 0.0;
+    for (size_t i = 0; i < claimed.size(); ++i)
+        if (claimed[i]) { ++tier_count; tier_bytes += (double) lay.blob_bytes((long long) (i / lay.n_expert)); }
+    std::printf("cuda%d (%s) helper tier BEFORE the arena: %lld pairs read pair by pair from the pack by the reader, "
+                "%.3f GiB of blobs, %.3f GiB free on that card before\n",
+                helper_device, hd.name.c_str(), tier_count, tier_bytes / GiB, free_gib);
+    std::fflush(stdout);
+
+    // ---- 2. the RAM arena re-laid WITHOUT exactly those pairs (piece (b)): claimed IS the mask
+    const uint64_t file_bytes_before = lay.total;
+    std::string derr;
+    if (!strata::kernels::cpu::expert_layout_drop(claimed, derr)) {
+        std::fprintf(stderr, "strata: expert tier gate: the drop refused: %s\n", derr.c_str());
+        return false;
+    }
+    std::printf("expert layout dropped: the RAM arena is now %.3f GiB of the pack's %.3f GiB: %.3f GiB of "
+                "holes, %lld pairs held by cuda%d alone\n",
+                (double) lay.total / GiB, (double) lay.file_total / GiB,
+                (double) (file_bytes_before - lay.total) / GiB, tier_count, helper_device);
+    std::fflush(stdout);
+
+    // ---- 3. the holed arena, loaded pair by pair around the holes (its own lines print its own words)
+    ArenaExpertSource arena;
+    arena.set_gguf(native);   // the pack is a native GGUF one: the arena reads the shards it names
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!arena.open(pack, lay.n_layers, lay.n_expert, 6, err)) {
+        std::fprintf(stderr, "strata: expert tier gate: the holed arena refused: %s\n", err.c_str());
+        return false;
+    }
+    const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!arena.ram_warning().empty())
+        std::fprintf(stderr, "strata: expert tier gate note: %s\n", arena.ram_warning().c_str());
+    std::printf("arena holed: %.3f GiB of experts loaded in %.1f s (%.2f GiB/s wall, registration included)\n",
+                (double) lay.total / GiB, load_s, (double) lay.total / GiB / (load_s > 0 ? load_s : 1.0));
+    std::fflush(stdout);
+
+    // ---- 4. fetch-back: the dropped pairs have NO RAM copy; the arena's aux_fetch (the helper's fetch)
+    // is the only way their bytes reach a host buffer.  Two dropped and two present pairs carry the list.
+    arena.aux_fetch = [&](int64_t l, int64_t e, uint8_t* dst) -> bool { return helpers.fetch(l, e, dst); };
+    int dropped_l[2] = {-1, -1}, dropped_e[2] = {-1, -1}, present_l[2] = {-1, -1}, present_e[2] = {-1, -1};
+    for (long long l = 0, d = 0, p = 0; l < lay.n_layers && (d < 2 || p < 2); ++l)
+        for (long long e = 0; e < lay.n_expert && (d < 2 || p < 2); ++e) {
+            const bool held_pair = claimed[(size_t) (l * lay.n_expert + e)] != 0;
+            if (held_pair && d < 2) { dropped_l[(size_t) d] = (int) l; dropped_e[(size_t) d++] = (int) e; }
+            if (!held_pair && p < 2) { present_l[(size_t) p] = (int) l; present_e[(size_t) p++] = (int) e; }
+        }
+    unsigned long long host_hash[4] = {0, 0, 0, 0};
+    std::printf("dropped pick (%d,%d) and (%d,%d): the arena calls them %s and %s\n",
+                dropped_l[0], dropped_e[0], dropped_l[1], dropped_e[1],
+                arena.transient(dropped_l[0], dropped_e[0]) ? "transient" : "NOT transient",
+                arena.transient(dropped_l[1], dropped_e[1]) ? "transient" : "NOT transient");
+    std::fflush(stdout);
+    const bool fetch_ok = dropped_l[1] >= 0 && arena.transient(dropped_l[0], dropped_e[0])
+        && arena.transient(dropped_l[1], dropped_e[1]);
+    bool copy_ok = fetch_ok;
+    for (int i = 0; i < 2 && copy_ok; ++i) {
+        std::vector<uint8_t> buf((size_t) lay.blob_bytes(dropped_l[i]), 0);
+        const bool one = arena.copy_blob(dropped_l[i], dropped_e[i], buf.data());
+        copy_ok = one && !buf.empty();
+        std::printf("fetch-back of (%d, %d): copy_blob %s, %lld B into the host buffer\n",
+                    dropped_l[i], dropped_e[i], one ? "ran" : "refused", (long long) buf.size());
+        std::fflush(stdout);
+        if (copy_ok) host_hash[i] = fnv1a64(buf.data(), buf.size());
+    }
+    bool ram_ok = fetch_ok && copy_ok;
+    for (int i = 0; i < 2 && ram_ok; ++i) {
+        const uint8_t* b = arena.blob_at(present_l[i], present_e[i]);
+        std::printf("present pick (%d, %d): the RAM arena answers %s\n",
+                    present_l[i], present_e[i], b != nullptr ? "a pointer into itself" : "nothing");
+        std::fflush(stdout);
+        if (b == nullptr) { ram_ok = false; break; }
+        host_hash[2 + i] = fnv1a64(b, (uint64_t) lay.blob_bytes(present_l[i]));
+    }
+    if (!fetch_ok || !copy_ok || !ram_ok) {
+        std::fprintf(stderr, "strata: expert tier gate: a site gave nothing: dropped pair found no fetchable bytes, "
+                             "or the RAM hashes could not be taken\n");
+        return false;
+    }
+    std::printf("fetched back %d dropped pairs from cuda%d: the arena calls them transient, aux_fetch = RemoteExperts::fetch, "
+                "%.3f GiB into host buffers hashed HERE\n",
+                2, helper_device,
+                ((double) lay.blob_bytes(dropped_l[0]) + (double) lay.blob_bytes(dropped_l[1])) / GiB);
+    std::fflush(stdout);
+
+    // ---- 4b. the PACK itself, hashed a fourth time through the gate's own reader (tier_file): which site,
+    // if any, is the odd one out
+    unsigned long long file_hash[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4; ++i) {
+        const int l = i < 2 ? dropped_l[i] : present_l[i - 2];
+        const int e = i < 2 ? dropped_e[i] : present_e[i - 2];
+        const uint8_t* b = tier_file.blob_stable(l, e);
+        file_hash[i] = b ? fnv1a64(b, (uint64_t) lay.blob_bytes(l)) : 0ull;
+    }
+
+    // ---- 5. the library's OWN tier (AMD) hashes the SAME four pairs, inside its HIP runtime
+    const Eng& L = engine_lib();
+    if (!L.ok) {
+        std::fprintf(stderr, "strata: expert tier gate: no %s next to the engine: no AMD tier to hash in this process\n",
+                     STRATA_HIP_ENGINE_LIB_NAME);
+        return false;
+    }
+    const auto hashfn = (strata_hip_expert_hash_fn) sym(L.h, "strata_hip_expert_hash");
+    if (hashfn == nullptr) {
+        std::fprintf(stderr, "strata: %s has no expert hash entry: the library cannot answer the join\n", L.path.c_str());
+        return false;
+    }
+    StrataExpertPairs asked{};
+    std::snprintf(asked.pack, sizeof asked.pack, "%s", pack.c_str());
+    std::snprintf(asked.native, sizeof asked.native, "%s", native.c_str());
+    asked.n_layers = lay.n_layers;
+    asked.n_expert = lay.n_expert;
+    asked.n_pairs = 4;
+    for (int i = 0; i < 2; ++i) {
+        asked.pairs[2 * i] = dropped_l[i];
+        asked.pairs[2 * i + 1] = dropped_e[i];
+        asked.pairs[2 * (2 + i)] = present_l[i];
+        asked.pairs[2 * (2 + i) + 1] = present_e[i];
+    }
+    asked.device = 0;   // the AMD ordinal inside the library's own HIP runtime, as --list-runtimes numbers it
+    StrataExpertOut got{};
+    const int e2 = hashfn(&asked, (int) sizeof(StrataExpertPairs), &got, (int) sizeof(StrataExpertOut));
+    if (e2 != 0) {
+        std::fprintf(stderr, "strata: expert tier gate: the library tier entry refused (%d): %s\n", e2, got.err);
+        return false;
+    }
+    std::printf("hip%d (%s) library tier: archs %s, %.3f GiB of VRAM cache, 4 pairs (2 dropped + 2 present) filled "
+                "from experts.bin INSIDE the library in %.2f s, slots read back and hashed THERE\n",
+                0, got.card, got.archs, (double) got.cache_bytes / GiB, got.fill_s);
+    std::fflush(stdout);
+
+    // ---- 6. the join's measurement: one byte-stream, three sites, two numbers per pair
+    bool all_equal = got.ran == 1;
+    for (int i = 0; i < 4; ++i) {
+        const bool equal = host_hash[i] == got.hash[i] && got.blob_bytes[i] > 0;
+        all_equal = all_equal && equal;
+        std::printf("pair (%d, %d): %s: host %016llx vs library %016llx vs the pack-file %016llx over %lld B: %s\n",
+                    i < 2 ? dropped_l[i] : present_l[i - 2], i < 2 ? dropped_e[i] : present_e[i - 2],
+                    i < 2 ? "dropped, fetched from the NVIDIA tier" : "present, read from the RAM arena",
+                    host_hash[i], got.hash[i], file_hash[i], (long long) got.blob_bytes[i],
+                    equal ? "equal" : "NOT EQUAL");
+        std::fflush(stdout);
+    }
+    std::fprintf(stderr, "strata: expert tier gate: %s.  The lines above are what this measured: a helper tier "
+                         "filled from experts.bin BEFORE the arena, the RAM arena re-laid WITHOUT those pairs, "
+                         "the dropped ones fetched back, and the same bytes hashed by the library's AMD tier\n",
+                 all_equal ? "PROVEN" : "NOT PROVEN");
+    return all_equal;
 }
 
 // ONE process, both brands: this build's own runtime first (upstream's numbering), then the AMD cards the

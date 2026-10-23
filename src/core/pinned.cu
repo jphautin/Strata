@@ -734,6 +734,83 @@ LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::
     return st;
 }
 
+LoadStats load_experts_holed(const std::string& path, uint8_t* dst,
+                             const strata::kernels::cpu::ExpertLayout& lay, int threads,
+                             const std::atomic<int>* ready) {
+    LoadStats st;
+    st.ok = false;
+    if (!lay.native || lay.pos.empty()) return st;   // not a dropped native layout: this loader is not the way
+    struct Job { uint64_t file, dst, n; int layer; };
+    std::vector<Job> jobs;
+    uint64_t bytes = 0;
+    for (int64_t l = 0; l < lay.n_layers; ++l) {
+        const uint64_t b = lay.blob_bytes(l);
+        for (int64_t e = 0; e < lay.n_expert; ++e) {
+            const int32_t p = lay.pos[(size_t) (l * lay.n_expert + e)];
+            if (p < 0) continue;                       // the hole: the helper card holds this expert, RAM does not
+            jobs.push_back({lay.file_blob_offset(l, e), lay.layer_offset(l) + (uint64_t) p * b, b, (int) l});
+            bytes += b;
+        }
+    }
+    if (threads < 1) threads = 1;
+    std::atomic<size_t> next{0};
+    std::mutex err_mu;
+    std::string err;
+    std::atomic<uint64_t> read_ns{0}, copy_ns{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    auto worker = [&]() {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            std::lock_guard<std::mutex> g(err_mu);
+            if (err.empty()) err = "cannot open " + path + " for the holed load";
+            next = jobs.size();
+            return;
+        }
+        std::vector<uint8_t> buf;
+        for (;;) {
+            const size_t i = next.fetch_add(1);
+            if (i >= jobs.size()) break;
+            if (ready != nullptr)
+                while (ready->load(std::memory_order_acquire) <= jobs[i].layer + 1) std::this_thread::yield();
+            if (buf.size() < jobs[i].n) buf.resize(jobs[i].n);
+            if (!f.good()) f.clear();
+            f.seekg((std::streampos) jobs[i].file);
+            const auto r0 = std::chrono::steady_clock::now();
+            f.read((char*) buf.data(), (std::streamsize) jobs[i].n);
+            const auto r1 = std::chrono::steady_clock::now();
+            if ((uint64_t) f.gcount() != jobs[i].n) {
+                std::lock_guard<std::mutex> g(err_mu);
+                if (err.empty()) err = "short holed read at file offset " + std::to_string(jobs[i].file) +
+                                       ": got " + std::to_string(f.gcount()) + " of " + std::to_string(jobs[i].n) + " B";
+                next = jobs.size();
+                break;
+            }
+            const auto c0 = std::chrono::steady_clock::now();
+            std::memcpy(dst + jobs[i].dst, buf.data(), (size_t) jobs[i].n);
+            const auto c1 = std::chrono::steady_clock::now();
+            read_ns.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(r1 - r0).count(),
+                              std::memory_order_relaxed);
+            copy_ns.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(c1 - c0).count(),
+                              std::memory_order_relaxed);
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+    worker();
+    for (auto& t : pool) t.join();
+    st.layers = (uint64_t) lay.n_layers;
+    if (!err.empty()) {
+        st.seconds = -1.0;
+        st.error = err;
+        return st;
+    }
+    st.ok = true;
+    st.bytes = bytes;
+    st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    st.read_seconds = (double) read_ns.load() / 1e9;
+    return st;
+}
+
 bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
                         bool cache_counts, uint64_t read_bytes) {
     const char* env = std::getenv("STRATA_UNBUFFERED_LOAD");

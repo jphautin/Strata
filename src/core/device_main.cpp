@@ -45,6 +45,13 @@ int main(int argc, char** argv) {
     // many bytes in ITS arena, and the engine library holds the same in ITS arena inside its HIP
     // runtime (0 = the gate stays off, keep it off only to read the cards alone).
     long long arena_bytes = 256ll << 20;
+    // C.5: --probe-expert: the expert tiers across the join (hip_kernels_loader.cpp's expert_tier_gate).
+    // The geometry the host side reads itself (the pack's native_experts.txt may still prune n_expert -
+    // its header wins there), the tier size in PAIRS of the profile order, the helper's CUDA ordinal.
+    bool probe_expert = false;
+    std::string expert_pack, expert_native, expert_profile;
+    long long expert_layers = 0, expert_experts = 0;
+    int expert_pairs = 0, expert_device = 0;
 #endif
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
@@ -62,6 +69,14 @@ int main(int argc, char** argv) {
         else if (i + 1 < argc && std::strcmp(argv[i], "--stage-context") == 0) stage_context = std::atoll(argv[++i]);
         else if (i + 1 < argc && std::strcmp(argv[i], "--stage-device") == 0) stage_device = std::atoi(argv[++i]);
         else if (i + 1 < argc && std::strcmp(argv[i], "--arena-bytes") == 0) arena_bytes = std::atoll(argv[++i]);
+        else if (std::strcmp(argv[i], "--probe-expert") == 0) probe_expert = true;
+        else if (i + 1 < argc && std::strcmp(argv[i], "--expert-pack") == 0) expert_pack = argv[++i];
+        else if (i + 1 < argc && std::strcmp(argv[i], "--expert-native") == 0) expert_native = argv[++i];
+        else if (i + 1 < argc && std::strcmp(argv[i], "--expert-profile") == 0) expert_profile = argv[++i];
+        else if (i + 1 < argc && std::strcmp(argv[i], "--expert-layers") == 0) expert_layers = std::atoll(argv[++i]);
+        else if (i + 1 < argc && std::strcmp(argv[i], "--expert-experts") == 0) expert_experts = std::atoll(argv[++i]);
+        else if (i + 1 < argc && std::strcmp(argv[i], "--expert-pairs") == 0) expert_pairs = std::atoi(argv[++i]);
+        else if (i + 1 < argc && std::strcmp(argv[i], "--expert-device") == 0) expert_device = std::atoi(argv[++i]);
 #endif
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("usage: strata-device [--selftest] [--list-devices]\n"
@@ -77,6 +92,12 @@ int main(int argc, char** argv) {
             std::printf("  --arena-bytes N  bytes to ask of EACH runtime's OWN arena during --list-runtimes (default\n"
                         "                  268435456 = 256 MiB; 0 = skip the arenas, read the cards only). Each arena\n"
                         "                  prints ONLY its own asked/held/free/total and the pin cap read on ITS side\n");
+            std::printf("  --probe-expert  the expert tiers across the join: a NVIDIA tier of experts.bin filled BEFORE\n"
+                        "                  the RAM arena (its own reader), the RAM arena re-laid WITHOUT those pairs\n"
+                        "                  (holes), the dropped ones fetched back, and the library's AMD tier hashing\n"
+                        "                  the SAME pairs - two hashes per pair, three sites\n"
+                        "                  --expert-pack DIR --expert-profile FILE --expert-layers L --expert-experts E\n"
+                        "                  --expert-pairs N [--expert-native SHARD1] [--expert-device D]\n");
 #endif
 
             return 0;
@@ -167,6 +188,25 @@ int main(int argc, char** argv) {
         return arenas ? 0 : 3;
 #else
         std::fprintf(stderr, "strata-device: --list-runtimes needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
+        return 2;
+#endif
+    }
+
+    // CODE.md C.5: the expert tiers across the join - the measurement in hip_kernels_loader.cpp's gate.
+    if (probe_expert) {
+#ifdef STRATA_MULTI_BRAND
+        if (expert_pack.empty() || expert_profile.empty() || expert_layers <= 0 || expert_experts <= 0 ||
+            expert_pairs <= 0) {
+            std::fprintf(stderr, "strata-device: --probe-expert needs --expert-pack DIR --expert-profile FILE "
+                                 "--expert-layers L --expert-experts E --expert-pairs N\n");
+            return 2;
+        }
+        const bool tiers = strata::core::expert_tier_gate(expert_pack, expert_native, expert_profile,
+                                                          expert_layers, expert_experts, expert_pairs,
+                                                          expert_device);
+        return tiers ? 0 : 3;
+#else
+        std::fprintf(stderr, "strata-device: --probe-expert needs a multi-brand build (-DSTRATA_MULTI_BRAND=ON)\n");
         return 2;
 #endif
     }

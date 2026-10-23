@@ -22,6 +22,34 @@ ExpertLayout g_layout;
 
 const ExpertLayout& expert_layout() { return g_layout; }
 
+/// CODE.md C.5 (remote drop, ported from the user's prior art): the RAM arena re-laid WITHOUT the experts a
+/// helper card holds.  `drop` is n_layers x n_expert, 1 = held by the helper only.  After this, blob_offset()
+/// is the holed RAM layout and file_blob_offset() experts.bin's own, unchanged - `total` is the arena's size
+/// and `file_total` the file's, so a size check can tell the two apart.  This runs on BOTH copies of the
+/// layout that exist in a mixed process (the host's and the HIP library's own global): the mask is carried
+/// across the join as plain bytes, and each side applies it to its own g_layout.
+bool expert_layout_drop(const std::vector<uint8_t>& drop, std::string& err) {
+    ExpertLayout& L = g_layout;
+    if (!L.native) { err = "dropping experts from RAM needs a native pack"; return false; }
+    if (!L.pos.empty()) { err = "expert_layout_drop: already dropped"; return false; }
+    const int64_t ne = L.n_expert;
+    if ((int64_t) drop.size() != L.n_layers * ne) { err = "expert_layout_drop: wrong mask size"; return false; }
+    L.file_offset = L.offset;
+    L.file_total = L.total;
+    L.pos.assign(drop.size(), -1);
+    uint64_t at = 0;
+    for (int64_t l = 0; l < L.n_layers; ++l) {
+        L.offset[(size_t) l] = at;
+        int32_t n = 0;
+        for (int64_t e = 0; e < ne; ++e)
+            if (!drop[(size_t) (l * ne + e)]) L.pos[(size_t) (l * ne + e)] = n++;
+        at += L.bytes[(size_t) l] * (uint64_t) n;
+    }
+    L.total = at;
+    err.clear();
+    return true;
+}
+
 int cpu_isa_cap() {
     // STRATA_FORCE_ISA (tests, the experimental older-CPU builds): the engine's own dispatch acts as if this CPU
     // stopped at that level.  ggml-cpu is not affected: it runs what the build compiled it for.

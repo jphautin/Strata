@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <atomic>
+#include <functional>
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
@@ -230,6 +231,10 @@ public:
     /// blob of (layers[i], experts[i]).  A source that reads a drive may merge neighbouring blobs into one request.
     /// Default: copy_blob one by one.
     virtual bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
+    /// CODE.md C.5 (remote drop): set by the DRIVER, not by the source. For pairs some helper card holds
+    /// and RAM does not (`transient` true, no RAM copy anywhere), this answers "copy their bytes into `dst`"
+    /// - typically one host-side fetch from the helper tier's VRAM. Empty = nobody can produce those bytes.
+    std::function<bool(int64_t, int64_t, uint8_t*)> aux_fetch;
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -1073,6 +1078,11 @@ public:
     int64_t reads() const { return reads_.load(std::memory_order_relaxed); }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    /// CODE.md C.5 (remote drop): a pair the RAM arena does NOT hold (`present()` false): `blob` refuses it,
+    /// `transient` is true so the prompt path copies it instead, and the copy comes from `aux_fetch` -
+    /// the helper tier's VRAM copy.  Present pairs: today's answers, unchanged.
+    bool transient(int64_t layer, int64_t expert) const override;
+    bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// Prefix pinning: the old rule (device_alias(layer, 0)); pin by need: at least one pinned range in the layer.
     bool pcie_layer(int64_t layer) const override;
     void prefetch(int64_t layer, int64_t expert) override;

@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -27,11 +28,19 @@ public:
     /// Initialise the device before the host expert arena registers
     /// tens of GiB of portable mapped memory with CUDA.
     static bool preflight(int device, double& free_gib, std::string& err);
+    /// CODE.md C.5 (remote drop, ported): `reader` (when set) is where the blobs COME FROM - experts.bin read
+    /// expert by expert, BEFORE the RAM arena exists (the arena is re-laid WITHOUT what this tier holds, so
+    /// `source.blob()` cannot answer for these pairs). Null `reader` = today's path: blobs from `source`.
     bool open(int device, int slots, int64_t layers, int64_t experts,
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
-              std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false);
+              std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false,
+              const std::function<const uint8_t*(int32_t, int32_t)>& reader = {});
     void close();
+    /// CODE.md C.5, piece (c): copy a held expert's blob back to host memory `dst` (the prompt path and the
+    /// CPU pool read it from there - a dropped expert has no RAM copy anywhere else). False when this tier
+    /// does not hold the pair or the copy failed.
+    bool fetch(int64_t layer, int64_t expert, uint8_t* dst);
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
     /// or null on the one-token path. Entries already served on CUDA0 are excluded.
@@ -80,6 +89,8 @@ private:
     float* h_x_ = nullptr;
     float* h_out_ = nullptr;
     void* h_meta_ = nullptr;
+    uint8_t* h_fetch_ = nullptr;   ///< C.5 fetch staging: pinned, reserved at open() BEFORE the RAM arena is
+    size_t fetch_cap_ = 0;         ///< committed; a fetch after it must not have to win a fresh pinned allocation
     float* d_x_ = nullptr;
     float* z_x_ = nullptr;     ///< h_x_ as the helper GPU sees it (zero-copy: no input copy per layer)
     float* z_out_ = nullptr;   ///< h_out_ as the helper GPU sees it (zero-copy: no result copy)
