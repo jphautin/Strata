@@ -2757,12 +2757,36 @@ int main(int argc, char** argv) {
     // a fast and a slow link cannot set the two apart from the command line (#485)
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
-    std::vector<int> split_devs;
+    std::vector<int> split_devs;   // the later stages' cards: a SLOT in split_cards (the block below)
+    std::vector<strata::core::DeviceInfo> split_cards;   // the cards ONE process can place a stage on
     bool split_auto = false, split_same = false;
+    auto card_id = [](const strata::core::DeviceInfo& c) {
+        return c.runtime == strata::core::DeviceRuntime::HIP
+                   ? "hip:" + std::to_string(c.ordinal)
+                   : (c.runtime == strata::core::DeviceRuntime::CUDA ? "cuda:" : "own:") +
+                         std::to_string(c.ordinal);
+    };
     if (!o.layer_split.empty()) {
-        int n_dev = 1;
-        if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) n_dev = 1;
-        cudaGetLastError();
+        // The cards one process can place a stage on, in ONE list: this build's own runtime first (upstream's
+        // numbering), then the AMD cards the library lists inside its own runtime (union_device_list, device.hpp:100
+        // - it applies STRATA_GPU_ORDER already, so the MAIN card the user chose at setup is index 0 here).  A split
+        // slot is an index into this list: in a one-brand process a slot is still just the ordinal the old code used.
+#ifdef STRATA_MULTI_BRAND
+        split_cards = strata::core::union_device_list();
+#endif
+        if (split_cards.empty()) {   // only the runtime this program knows: same cards as before, same numbering
+            int own = 1;
+            if (cudaGetDeviceCount(&own) != cudaSuccess || own < 1) own = 1;
+            cudaGetLastError();
+            const bool hip_build = strata::core::compiled_gpu_archs() && strata::core::compiled_gpu_archs()[0];
+            for (int d = 0; d < own; ++d) {
+                strata::core::DeviceInfo i;
+                i.ordinal = d;
+                i.runtime = hip_build ? strata::core::DeviceRuntime::HIP : strata::core::DeviceRuntime::CUDA;
+                split_cards.push_back(i);
+            }
+        }
+        const int n_dev = (int) split_cards.size();
         auto ints = [](const std::string& str, auto& out) -> bool {
             using V = typename std::decay_t<decltype(out)>::value_type;
             size_t a = 0;
@@ -2778,7 +2802,44 @@ int main(int argc, char** argv) {
         };
         split_auto = o.layer_split == "auto";
         bool ok = o.serve && (split_auto || ints(o.layer_split, split_at));
-        if (ok && !o.split_device.empty()) ok = ints(o.split_device, split_devs);
+        // --split-device entries may be brand-tagged: "cuda:0"/"hip:0" name a card the process has (parse_device_id,
+        // device.hpp:29); a plain ordinal is this engine's own runtime, upstream's meaning.  The value kept is a
+        // SLOT in split_cards - the stage dispatch below maps a slot back to the brand that runs it.
+        const int own_cards = (int) strata::core::device_count();
+        auto slots = [&](const std::string& str, std::vector<int>& out) -> bool {
+            size_t a = 0;
+            while (a < str.size()) {
+                size_t b = str.find(',', a);
+                if (b == std::string::npos) b = str.size();
+                const std::string t = str.substr(a, b - a);
+                a = b + 1;
+                strata::core::DeviceRuntime rt = strata::core::DeviceRuntime::OWN;
+                int ord = -1;
+                if (t.empty() || !strata::core::parse_device_id(t, rt, ord)) return false;
+                int slot = -1;
+                for (int d = 0; d < n_dev; ++d) {
+                    const strata::core::DeviceInfo& c = split_cards[d];
+                    if (c.ordinal != ord) continue;
+                    if (rt == strata::core::DeviceRuntime::OWN) {
+                        if (d < own_cards) { slot = d; break; }
+                    } else if (c.runtime == rt) {
+                        slot = d;
+                        break;
+                    }
+                }
+                if (slot < 0) {
+                    std::string have;
+                    for (const strata::core::DeviceInfo& c : split_cards) have += (have.empty() ? "" : " ") + card_id(c);
+                    std::fprintf(stderr, "strata generate: --split-device entry \"%s\" names no card this process has "
+                                         "(the cards here: %s)\n",
+                                 t.c_str(), have.c_str());
+                    return false;
+                }
+                out.push_back(slot);
+            }
+            return !out.empty();
+        };
+        if (ok && !o.split_device.empty()) ok = slots(o.split_device, split_devs);
         else if (ok)
             for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d) split_devs.push_back(d);
         if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
@@ -2802,7 +2863,8 @@ int main(int argc, char** argv) {
         }
         if (!ok) {
             std::fprintf(stderr, "strata generate: --layer-split K[,K2..]|auto needs --serve, rising K from 2, and one "
-                                 "distinct GPU per K in --split-device (1..%d; or 0 with one K: the same GPU). K is the "
+                                 "distinct GPU per K in --split-device (slots 1..%d, or brand ids like cuda:0 and hip:0; "
+                                 "or 0 with one K: the same GPU). K is the "
                                  "FIRST LAYER of each later GPU, not a count of layers per card: \"24,36,42\" for 4 "
                                  "GPUs, not \"24,12,6,6\" (got \"%s\")\n", n_dev - 1, o.layer_split.c_str());
             return 2;
@@ -2885,12 +2947,20 @@ int main(int argc, char** argv) {
                 std::vector<int> devs = {0};
                 for (const int d : split_devs) devs.push_back(d);
                 for (const int d : devs) {
-                    cudaDeviceProp prop{};
-                    if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) { cudaGetLastError(); own = false; break; }
-                    const int64_t total_mib = (int64_t) (prop.totalGlobalMem >> 20);
+                    uint64_t total = (d >= 0 && d < (int) split_cards.size())
+                                         ? split_cards[(size_t) d].total_bytes
+                                         : 0;
+                    if (!total) {
+                        cudaDeviceProp prop{};
+                        if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) { cudaGetLastError(); own = false; break; }
+                        total = prop.totalGlobalMem;
+                    }
+                    const int64_t total_mib = (int64_t) (total >> 20);
                     if (reserve_mib * 100 > 12 * total_mib) {
                         own = false;
-                        why = "CUDA" + std::to_string(d) + " has " + std::to_string(total_mib) + " MiB";
+                        why = ((d >= 0 && d < (int) split_cards.size()) ? card_id(split_cards[(size_t) d])
+                                                                       : "CUDA" + std::to_string(d)) +
+                              " has " + std::to_string(total_mib) + " MiB";
                         break;
                     }
                 }
@@ -2915,16 +2985,38 @@ int main(int argc, char** argv) {
             while (next_free < n_vis &&
                    std::find(split_devs.begin(), split_devs.end(), next_free) != split_devs.end()) ++next_free;
             if (next_free >= n_vis) {
-                std::fprintf(stderr, "strata generate: --expert-cache-remote with a layer split needs a GPU that runs no "
-                                     "stage (%d visible, %zu used by the split)\n", n_vis, split_devs.size() + 1);
+                std::fprintf(stderr, "strata generate: --expert-cache-remote with a layer split needs a card of THIS "
+                                     "engine's own runtime that runs no stage (%d own cards visible, %zu used by the "
+                                     "split)\n",
+                             n_vis, split_devs.size() + 1);
                 return 2;
             }
             remote_dev[r] = next_free++;
         }
         std::string devs;
-        for (const int d : split_devs) devs += (devs.empty() ? "" : ",") + std::to_string(d);
-        std::fprintf(stderr, "strata generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
-                     split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
+        for (const int d : split_devs) devs += (devs.empty() ? "" : ",") + card_id(split_cards[(size_t) d]);
+        std::fprintf(stderr, "strata generate: layer split across %zu GPUs: %s, then %s (split %s)\n",
+                     split_devs.size() + 1, card_id(split_cards[0]).c_str(), devs.c_str(), o.layer_split.c_str());
+    }
+    // A stage the ids place on the OTHER brand's card: every stage's machinery (its dense-weights arena, NativeDense's
+    // layer range, the SplitDrive below) is THIS build's own runtime end to end - a whole stage across the join is the
+    // cut after this one (C.1's stage entries are its shape).  Refused AFTER the plan line above printed the split, so
+    // the log shows both the cards asked for and the refusal that NAMES the foreign one.  Before any model load.
+    if (multi_gpu) {
+        const bool hip_build = strata::core::compiled_gpu_archs() && strata::core::compiled_gpu_archs()[0];
+        const strata::core::DeviceRuntime own_rt =
+            hip_build ? strata::core::DeviceRuntime::HIP : strata::core::DeviceRuntime::CUDA;
+        std::vector<int> used_slots = {0};
+        for (const int d : split_devs) used_slots.push_back(d);
+        for (const int d : used_slots) {
+            if (d >= 0 && d < (int) split_cards.size() && split_cards[(size_t) d].runtime != own_rt) {
+                std::fprintf(stderr, "strata generate: a layer split asks for a stage on %s, which is not this "
+                                     "build's runtime (%s here): every stage's dense weights, arena and kernels are "
+                                     "native, and a whole stage across the join is wired in the next cut\n",
+                             card_id(split_cards[(size_t) d]).c_str(), hip_build ? "hip" : "cuda");
+                return 2;
+            }
+        }
     }
 #if defined(STRATA_USE_HIP)
     {
