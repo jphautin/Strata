@@ -254,6 +254,15 @@ bool stage_hold_gate(long long bytes, int device);
 bool stage_run_gate(const StrataStageArgs& args);
 bool stage_persist_gate(const StrataStageArgs& args);   // half (b): build once inside the library, replay twice
 
+// half (b) unit 2a: the SHIM in strata_core's loader (hip_kernels_loader.cpp) - the per-window contract a
+// mixed serve uses, glued into ONE call so no STALE window can be read between two entries: step answers
+// one window AND takes its payload into RAM the caller owns.  build: true = the stage is held in the library
+// (out, when given, is the caller's own StrataStageOut reading); step: floats copied (>0) or negative, with
+// the window's report in `report` when the caller wants it; free releases the held stage.
+bool engine_stage_build(const StrataStageArgs& args, StrataStageOut* out);
+long long engine_stage_step(const char* tokens, float* payload_out, int payload_floats, StrataStepOut* report);
+void engine_stage_free();
+
 // C.4's measurement: ONE arena per runtime, not one arena per process.  The host holds its OWN DeviceArena
 // (this process's runtime) and the library holds its OWN inside its HIP runtime through the two entries
 // above; each printed line carries ONLY its arena's asked/held/free-before-after/total, plus the

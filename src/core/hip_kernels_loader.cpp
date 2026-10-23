@@ -538,6 +538,61 @@ bool stage_run_gate(const StrataStageArgs& args) {
     return ok;
 }
 
+// ---- half (b) unit 2a: the SHIM - one call per window, payload glued to the step so a mixed serve can never
+// read a stale window between two entries.  The stage is HELD in the library between build and free; a serve
+// builds once, answers every window through step, and frees at the end of the run.
+bool engine_stage_build(const StrataStageArgs& args, StrataStageOut* out) {
+    static const auto fn = (strata_hip_stage_build_fn) sym(engine_lib().h, "strata_hip_stage_build");
+    if (fn == nullptr) {
+        std::fprintf(stderr, "strata: the engine library has no stage-build entry: no library stage in this process\n");
+        return false;
+    }
+    StrataStageOut dummy{};
+    StrataStageOut& o = out ? *out : dummy;              // the entry NEVER takes a null out: a caller that wants
+        if (out == nullptr) std::memset(&dummy, 0, sizeof(dummy));  //   no report gets a private reading
+    const int e = fn(&args, (int) sizeof(StrataStageArgs), &o, (int) sizeof(StrataStageOut));
+    if (e != 0) {
+        std::fprintf(stderr, "strata: the library stage refused at build (code %d, step %d): %s\n",
+                     e, o.refused_step, o.err);
+        return false;
+    }
+    return true;                                        // the stage is HELD inside the library now
+}
+
+long long engine_stage_step(const char* tokens, float* payload_out, int payload_floats, StrataStepOut* report) {
+    static const auto step_fn = (strata_hip_stage_step_fn) sym(engine_lib().h, "strata_hip_stage_step");
+    static const auto take_fn = (strata_hip_stage_payload_fn) sym(engine_lib().h, "strata_hip_stage_payload");
+    if (step_fn == nullptr || take_fn == nullptr) {
+        std::fprintf(stderr, "strata: the engine library has no step/payload pair: no per-window stage call\n");
+        return -1;
+    }
+    StrataStepArgs sa{};
+    std::snprintf(sa.tokens, sizeof(sa.tokens), "%s", tokens ? tokens : "");
+    StrataStepOut dummy{};
+    StrataStepOut& r = report ? *report : dummy;
+    if (report == nullptr) std::memset(&dummy, 0, sizeof(dummy));
+    const int e = step_fn(&sa, (int) sizeof(StrataStepArgs), &r, (int) sizeof(StrataStepOut));
+    if (e != 0) {
+        std::fprintf(stderr, "strata: the library stage step refused (code %d): %s\n", e, r.err);
+        return -1;
+    }
+    const long long held = r.payload_bytes / (long long) sizeof(float);   // floats the window WROTE
+    if (payload_out == nullptr || payload_floats < 1) return held;        // the caller only wants the report
+    const int got = take_fn(payload_out, payload_floats);                 // min(wrote, capacity) - one step,
+    if ((long long) got != held) {                                        //   one take: no stale window
+        std::fprintf(stderr, "strata: the window wrote %lld floats, %d came back: the payload did not cross\n",
+                     held, got);
+        return -1;
+    }
+    return (long long) got;
+}
+
+void engine_stage_free() {   // the held stage goes back; a serve does this once per run, like stage_hold did
+    static const auto fn = (strata_hip_stage_free_fn) sym(engine_lib().h, "strata_hip_stage_free");
+    if (fn == nullptr) return;
+    fn();
+}
+
 // Half (b): the SAME stage, TWO windows.  C.1's entry rebuilt everything for each window, which measures the
 // crossing but cannot serve a decode: a real run replays the SAME built stage every window.  The split entries
 // hold the stage in the library between build and free, so this gate proves the contract a decode needs:
@@ -553,23 +608,12 @@ bool stage_persist_gate(const StrataStageArgs& args) {
         std::fprintf(stderr, "strata: the persisted-stage gate needs strata_hip_engine next to the engine\n");
         return false;
     }
-    const auto build = (strata_hip_stage_build_fn) sym(L.h, "strata_hip_stage_build");
-    const auto step = (strata_hip_stage_step_fn) sym(L.h, "strata_hip_stage_step");
-    const auto take = (strata_hip_stage_payload_fn) sym(L.h, "strata_hip_stage_payload");
-    const auto done = (strata_hip_stage_free_fn) sym(L.h, "strata_hip_stage_free");
-    if (build == nullptr || step == nullptr || take == nullptr || done == nullptr) {
-        std::fprintf(stderr, "strata: %s has no split stage entries: it cannot hold a stage across windows here\n",
-                     L.path.c_str());
-        return false;
-    }
+    // the gate drives the SHIM (unit 2a): one call per window, the payload glued to the step so the gate
+    // itself cannot read a stale window between two entries
 
     StrataStageOut o{};
-    const int b = build(&args, (int) sizeof(StrataStageArgs), &o, (int) sizeof(StrataStageOut));
-    if (b != 0) {
-        std::fprintf(stderr, "strata: the persisted-stage gate refused at the build (code %d, step %d): %s\n",
-                     b, o.refused_step, o.err);
-        done();
-        return false;
+    if (!engine_stage_build(args, &o)) {
+        return false;                                   // the shim named the refusal (and released what it took)
     }
     std::printf("persist: the stage BUILT inside %s on hip:%d: layers [%d, %d) of %d: tier %.3f GiB with %d experts, "
                 "arena %.3f GiB, native %.3f GiB, Q8 %.3f GiB, session %.1f MiB, token table %.1f MiB host; card "
@@ -598,21 +642,20 @@ bool stage_persist_gate(const StrataStageArgs& args) {
     unsigned long long hash1 = 0;
     for (int w = 0; w < 2; ++w) {
         StrataStepOut so{};
-        const int sc = step(&sa, (int) sizeof(StrataStepArgs), &so, (int) sizeof(StrataStepOut));
-        if (sc != 0) {
-            std::fprintf(stderr, "strata: the persisted-stage gate refused at window %d (code %d): %s\n",
-                         w + 1, sc, so.err);
+        const long long cap = (long long) o.handoff_floats * 8;   // kVerifyMaxT rows of this stage's hand-off
+        std::vector<float> host((size_t) cap, 0.0f);
+        const long long got = engine_stage_step(sa.tokens, host.data(), (int) cap, &so);
+        if (got < 0) {
+            std::fprintf(stderr, "strata: the persisted-stage gate refused at window %d: %s\n", w + 1, so.err);
             ok = false;
             break;
         }
         const long long want = so.payload_bytes / (long long) sizeof(float);
-        std::vector<float> host((size_t) (want < 1 ? 1 : want), 0.0f);
-        const int got = take(host.data(), (int) want);
-        const unsigned long long here = fnv(host.data(), host.size() * sizeof(float));
-        if (got != (int) want || here != so.payload_hash) {
-            std::fprintf(stderr, "strata: window %d's payload did not cross: %d of %lld floats back, the "
+        const unsigned long long here = fnv(host.data(), (size_t) got * sizeof(float));
+        if (got != want || here != so.payload_hash) {
+            std::fprintf(stderr, "strata: window %d's payload did not cross: %lld of %lld floats back, the "
                                  "hashes %016llx here against %016llx there\n",
-                         w + 1, got, want, here, so.payload_hash);
+                         w + 1, (long long) got, want, here, so.payload_hash);
             ok = false;
             break;
         }
@@ -628,7 +671,7 @@ bool stage_persist_gate(const StrataStageArgs& args) {
                     w + 1, (long long) so.payload_bytes, here, so.run_ms, so.wait_ms);
         std::fflush(stdout);
     }
-    done();                                             // the held stage goes back; the card is free again
+    engine_stage_free();                                // the held stage goes back; the card is free again
 
     std::fprintf(stderr, "strata: persisted-stage gate: %s.  One stage built inside the HIP-built library "
                          "answered TWO windows without being rebuilt: both windows' payload bytes hashed the "
