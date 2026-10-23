@@ -13,7 +13,9 @@
 
 #include <string>
 
-#define STRATA_HIP_ENGINE_ABI_VERSION 4   // 4 = plus the expert-tier hash entry (C.5); a version-3, 2 or 1 library refuses
+#define STRATA_HIP_ENGINE_ABI_VERSION 5   // 5 = the stage entry split into BUILD and STEP (half (b): a stage must
+                                          //   persist across decode windows, and C.1's one-call entry rebuilt and ran
+                                          //   one window; v4 and older libraries refuse)
 
 #if defined(_WIN32)
 #define STRATA_HIP_ENGINE_LIB_NAME "strata_hip_engine.dll"
@@ -158,6 +160,27 @@ struct StrataStageOut {
     float first[8];                  // the first eight payload floats, printed as they came back
 };
 
+// C.6 half (b): the tokens of ONE window, as the caller writes them (decode: one id; a draft tree: up to
+// strata::kernels::kVerifyMaxT).  A step never builds: it replays the graphs of an ALREADY built stage - the
+// per-token contract the mixed serve needs, and one call per window keeps each window's payload measurable.
+struct StrataStepArgs {
+    char tokens[128];      // the window's ids, comma-separated as --tokens writes them (8 ids of 6 digits fit)
+};
+
+// What ONE step measured: the rows it ran, the payload's size and hash (the LIBRARY's own FNV over the bytes
+// it wrote, the caller hashes its copy - the C.1 rule per window), and the times.
+struct StrataStepOut {
+    char err[256];                   // what refused, in the library's own words (empty = the step ran)
+    int ran;                         // 1 = the window replayed
+    int rows;                        // rows this step ran (its tokens)
+    long long payload_bytes;         // rows * handoff_floats * 4, the bytes written into the mapped buffer
+    unsigned long long payload_hash; // FNV-1a over those bytes, computed HERE
+    double run_ms;                   // the window itself
+    double wait_ms;                  // the wait since the previous step (0 before the first): the build's cost is
+                                     // NOT in the step's run_ms, so a persisting stage shows up as ~0 build here
+    long long steps_total;           // steps this built stage has run, this one included
+};
+
 extern "C" {
 typedef long long (*strata_engine_abi_fn)();
 typedef int (*strata_engine_probe_fn)(void* out);  // out IS a StrataEngineProbe*
@@ -187,7 +210,18 @@ typedef int (*strata_hip_stage_run_fn)(const void* args, int args_size, void* ou
 // StrataStageOut's handoff_floats and rows, hashes what it receives, and compares that against payload_hash:
 // two hashes of the same bytes, computed on the two sides of the join, is the measurement that the crossing
 // carried the activations and not a copy of the same buffer.
-typedef int (*strata_hip_stage_payload_fn)(float* dst, int dst_floats);
+typedef int (*strata_hip_stage_payload_fn)(float* dst, int dst_floats); 
+
+// C.6 half (b): the stage entry SPLIT so a stage can persist across the windows of a real run - C.1's one-call
+// entry rebuilt the WHOLE stage and ran ONE window, which measures the crossing but cannot serve a decode.
+// build takes the SAME StrataStageArgs (FIRST stage [0,K) only, hand_in null - unchanged shape) and holds the
+// stage's objects in the library's own file-static; step replays the built graphs for one window's tokens
+// (StrataStepArgs) and leaves that window's payload for strata_hip_stage_payload; stage_free releases the stage.
+// A step with no built stage returns -2 with the reason in out's err; so does a SECOND build over an
+// already-held stage - one stage at a time, released by strata_hip_stage_free.
+// build: 0 = built (out is a StrataStageOut; its window fields stay 0, build_s carries the load); step: 0 ran.
+typedef int (*strata_hip_stage_build_fn)(const void* args, int args_size, void* out, int out_size);
+typedef int (*strata_hip_stage_step_fn)(const void* args, int args_size, void* out, int out_size);
 
 // C.4: hold a block in the arena of THIS library (the engine's own DeviceArena inside the HIP runtime, on
 // the AMD card), then let go.  The CUDA loader holds ITS own arena in ITS runtime, same call, and each side
@@ -218,6 +252,7 @@ bool stage_hold_gate(long long bytes, int device);
 // bytes THIS side holds equals the hash the LIBRARY reported over the bytes it wrote.  Refuses (false) with
 // the reason printed when there is no such library, when the stage refused, or when the two hashes disagree.
 bool stage_run_gate(const StrataStageArgs& args);
+bool stage_persist_gate(const StrataStageArgs& args);   // half (b): build once inside the library, replay twice
 
 // C.4's measurement: ONE arena per runtime, not one arena per process.  The host holds its OWN DeviceArena
 // (this process's runtime) and the library holds its OWN inside its HIP runtime through the two entries

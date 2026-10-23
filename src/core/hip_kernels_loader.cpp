@@ -538,6 +538,105 @@ bool stage_run_gate(const StrataStageArgs& args) {
     return ok;
 }
 
+// Half (b): the SAME stage, TWO windows.  C.1's entry rebuilt everything for each window, which measures the
+// crossing but cannot serve a decode: a real run replays the SAME built stage every window.  The split entries
+// hold the stage in the library between build and free, so this gate proves the contract a decode needs:
+// build ONCE inside the library, replay the same window TWICE on the held stage, take each window's payload
+// back into RAM this process owns, and each window's bytes must hash the same on both sides - and the second
+// window carries no load at all: the library's step line says which step it is, and its wait is only the gap
+// between windows, never the stage's seconds.  Whether the two replays' payloads are EQUAL is printed as
+// information, not demanded: a session that advanced between windows may answer differently, and the decode
+// does not require them to agree.  true = built once, replayed twice, both windows crossed at the byte level.
+bool stage_persist_gate(const StrataStageArgs& args) {
+    const Eng& L = engine_lib();
+    if (!L.ok) {
+        std::fprintf(stderr, "strata: the persisted-stage gate needs strata_hip_engine next to the engine\n");
+        return false;
+    }
+    const auto build = (strata_hip_stage_build_fn) sym(L.h, "strata_hip_stage_build");
+    const auto step = (strata_hip_stage_step_fn) sym(L.h, "strata_hip_stage_step");
+    const auto take = (strata_hip_stage_payload_fn) sym(L.h, "strata_hip_stage_payload");
+    const auto done = (strata_hip_stage_free_fn) sym(L.h, "strata_hip_stage_free");
+    if (build == nullptr || step == nullptr || take == nullptr || done == nullptr) {
+        std::fprintf(stderr, "strata: %s has no split stage entries: it cannot hold a stage across windows here\n",
+                     L.path.c_str());
+        return false;
+    }
+
+    StrataStageOut o{};
+    const int b = build(&args, (int) sizeof(StrataStageArgs), &o, (int) sizeof(StrataStageOut));
+    if (b != 0) {
+        std::fprintf(stderr, "strata: the persisted-stage gate refused at the build (code %d, step %d): %s\n",
+                     b, o.refused_step, o.err);
+        done();
+        return false;
+    }
+    std::printf("persist: the stage BUILT inside %s on hip:%d: layers [%d, %d) of %d: tier %.3f GiB with %d experts, "
+                "arena %.3f GiB, native %.3f GiB, Q8 %.3f GiB, session %.1f MiB, token table %.1f MiB host; card "
+                "%.3f GiB free before, %.3f GiB while HELD; load %.1f s, tier fill %.1f s\n",
+                L.path.c_str(), o.device, o.lb, o.le, o.n_layers,
+                (double) o.cache_bytes / 1073741824.0, o.resident_experts,
+                (double) o.arena_bytes / 1073741824.0, (double) o.dense_bytes / 1073741824.0,
+                (double) o.hc_q8_bytes / 1073741824.0, (double) o.session_bytes / 1048576.0,
+                (double) o.embed_bytes / 1048576.0,
+                (double) o.free_before / 1073741824.0, (double) o.free_after / 1073741824.0,
+                o.build_s, o.fill_s);
+    std::fflush(stdout);
+
+    auto fnv = [](const void* pv, size_t n) {
+        unsigned long long h = 1469598125565353939ull;
+        for (const unsigned char* b = (const unsigned char*) pv, * e2 = b + n; b != e2; ++b)
+            h = (((unsigned long long) (*b)) ^ h) * 10995116277794481ull;
+        return h;
+    };
+
+    StrataStepArgs sa{};
+    std::snprintf(sa.tokens, sizeof(sa.tokens), "%s", args.tokens);   // the same window, replayed twice
+
+    bool ok = true;
+    bool got1 = false;
+    unsigned long long hash1 = 0;
+    for (int w = 0; w < 2; ++w) {
+        StrataStepOut so{};
+        const int sc = step(&sa, (int) sizeof(StrataStepArgs), &so, (int) sizeof(StrataStepOut));
+        if (sc != 0) {
+            std::fprintf(stderr, "strata: the persisted-stage gate refused at window %d (code %d): %s\n",
+                         w + 1, sc, so.err);
+            ok = false;
+            break;
+        }
+        const long long want = so.payload_bytes / (long long) sizeof(float);
+        std::vector<float> host((size_t) (want < 1 ? 1 : want), 0.0f);
+        const int got = take(host.data(), (int) want);
+        const unsigned long long here = fnv(host.data(), host.size() * sizeof(float));
+        if (got != (int) want || here != so.payload_hash) {
+            std::fprintf(stderr, "strata: window %d's payload did not cross: %d of %lld floats back, the "
+                                 "hashes %016llx here against %016llx there\n",
+                         w + 1, got, want, here, so.payload_hash);
+            ok = false;
+            break;
+        }
+        if (w == 0) {
+            hash1 = here;
+            got1 = true;
+        } else if (got1 && here != hash1) {
+            std::printf("persist: the two replays differ at the payload: the session moved between windows - "
+                        "information only, the decode does not demand they agree\n");
+        }
+        std::printf("persist: window %d of the HELD stage: %lld B of hand-off back in RAM I own, both sides "
+                    "hash %016llx, the window %.1f ms (%.1f ms since the last ended - the load is NOT in here)\n",
+                    w + 1, (long long) so.payload_bytes, here, so.run_ms, so.wait_ms);
+        std::fflush(stdout);
+    }
+    done();                                             // the held stage goes back; the card is free again
+
+    std::fprintf(stderr, "strata: persisted-stage gate: %s.  One stage built inside the HIP-built library "
+                         "answered TWO windows without being rebuilt: both windows' payload bytes hashed the "
+                         "same on the library's side and on this process's side, and the library says which "
+                         "step each window was\n", ok ? "PROVEN" : "NOT PROVEN");
+    return ok;
+}
+
 // C.4's measurement: ONE ARENA PER RUNTIME, not one arena per process.  A mixed process has two runtimes up,
 // and today one arena serves only the build's own: this gate makes each runtime hold and release ITS OWN
 // DeviceArena on ITS OWN card - this process's arena on the card its runtime numbers 0 (printed first), and

@@ -145,8 +145,9 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_hold(long long bytes, int device, 
 }
 
 // Let go: the arena's own destructor gives the card's memory back. The CUDA side does this once per run, so
-// what is measured is "held while CUDA holds its own", not "two pools that never end".
-STRATA_HIP_ENGINE_EXPORT void strata_hip_stage_free() { g_arena.reset(); }
+// what is measured is "held while CUDA holds its own", not "two pools that never end".  half (b): this entry
+// is DEFINED below, beside the held-stage machinery, because it now releases a HELD stage too - the forward
+// call at its old place would have named a function in the wrong scope.
 
 // ================================ C.1: one REAL engine stage, inside this library ================================
 //
@@ -217,7 +218,119 @@ struct OwnHost {     // the mapped pinned buffers this entry owns, UNLESS the st
 
 }  // namespace
 
+// ---- half (b): the stage objects HELD between stage_build and stage_free -------------------------------
+// C.1's entry built everything, ran ONE window and let go: it measures the crossing but cannot serve a decode,
+// which replays the SAME built stage every window.  So the stage lives HERE, in this library, between the two
+// entries - one stage at a time, released by strata_hip_stage_free - and the old body's order is kept exactly,
+// split around its middle, so C.1's gate sees the same bytes, the same prints and the same card readings.
+namespace {
+struct StageHeld {
+    OwnDevice own;                  // the arena, the session carve, the residency table: freed when the stage goes
+    OwnHost own_host;               // the pinned hand-off; keep=true only while a payload of it is owed to a caller
+    std::unique_ptr<strata::core::WeightTable> wt;
+    std::unique_ptr<strata::core::NativeEmbed> embed;
+    std::unique_ptr<strata::core::NativeDense> dense;
+    std::unique_ptr<strata::core::SessionState> ss;
+    std::unique_ptr<strata::core::ExpertCache> cache;
+    std::unique_ptr<strata::core::Verifier> ver;
+    strata::core::VerifyHits vh;               // points INTO the unique_ptrs: it lives exactly as long as they do
+    strata::core::ModelGeometry g;             // the Verifier keeps a POINTER to it (verify.hpp:511): it must live
+                                               //   with the stage, not on the build's stack - a held replay reads
+                                               //   it every window, and a stack geometry died with the build
+    std::vector<int32_t> host_res, picks;
+    int32_t* d_res = nullptr;
+    float* hb = nullptr;            // the mapped pinned hand-off buffer, held between windows
+    float* hb_dev = nullptr;
+    int HB = 0;                     // the stage's handoff_floats (Verifier::handoff_floats of its geometry)
+    int n_expert = 0, device = -1;
+    long long n_layers = 0, lb = 0, le = 0;
+    int steps = 0;
+    long long last_step_ms = 0;     // when the last step ended: the NEXT step's wait
+    bool built = false;
+};
+StageHeld* g_stage = nullptr;
+
+void stage_delete_partial() {       // a build/step that refused halfway: what it took goes back, the stage is gone
+    delete g_stage;
+    g_stage = nullptr;
+}
+
+// half (b): the held stage goes back on request - strata_hip_stage_free, DEFINED HERE because it must see
+// the stage.  A payload still owed to the caller keeps its pinned buffer (the payload entry already set
+// keep when it copied, this is the second sight of it); the arena and the session carve always go.
+STRATA_HIP_ENGINE_EXPORT void strata_hip_stage_free() {
+    if (g_stage) {
+        if (g_payload.held && g_payload.host == g_stage->hb) g_stage->own_host.keep = true;
+        delete g_stage;
+        g_stage = nullptr;
+    }
+    g_arena.reset();
+}
+}  // anonymous
+
+static int stage_build_into(const void* args, int args_size, void* out, int out_size);
+static int stage_step_into(const void* args, int args_size, void* out, int out_size);
+static void stage_measure_and_release(StrataStageOut* o);
+
+// C.1's one-call entry, unchanged in what it measures: build, ONE window, the old card reading and the old
+// prints, and let go - now produced by the two halves below, in the old order.
 STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_size, void* out, int out_size) {
+    if (args == nullptr || out == nullptr ||
+        (int) sizeof(StrataStageArgs) != args_size || (int) sizeof(StrataStageOut) != out_size)
+        return -1;                        // the two sides do not agree on the block: nothing is read
+    const int b = stage_build_into(args, args_size, out, out_size);
+    if (b != 0) return b;
+    const StrataStageArgs& a = *(const StrataStageArgs*) args;
+    StrataStepArgs sa;                    // the same window's ids the args block named, as C.1 ran them
+    std::snprintf(sa.tokens, sizeof(sa.tokens), "%s", a.tokens);
+    StrataStepOut so;
+    std::memset(&so, 0, sizeof(so));
+    const int s = stage_step_into(&sa, (int) sizeof(sa), &so, (int) sizeof(so));
+    if (s != 0) {
+        stage_delete_partial();           // the old body left scope here too: objects back, no payload held
+        return s;
+    }
+    StrataStageOut* o = (StrataStageOut*) out;
+    o->window_runs = 1;
+    o->rows = 8;                              // kMaxT: the buffer's capacity, printed as C.1 printed it
+    o->handoff_floats = g_stage->HB;
+    o->payload_bytes = so.payload_bytes;
+    o->payload_hash = so.payload_hash;
+    o->run_ms = so.run_ms;
+    o->nan_count = 0;
+    for (int i = 0; i < 8; ++i) {
+        o->first[i] = g_stage->hb[i];
+        if (o->first[i] != o->first[i]) ++o->nan_count;   // a NaN is the only value not equal to itself
+    }
+    o->read_back_ok = 1;
+    stage_measure_and_release(o);         // the old last act: objects let go, the card read, then the prints
+    return 0;
+}
+
+// half (b)'s entries: the stage is HELD between build and free, so a window costs only its replay.  A step
+// without a built stage returns -2 with the reason in the block; so does a second build over a held stage.
+STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_build(const void* args, int args_size, void* out, int out_size) {
+    if (g_stage) return -2;               // one stage at a time: the caller frees it first
+    const int b = stage_build_into(args, args_size, out, out_size);
+    if (b != 0 && g_stage) stage_delete_partial();
+    return b;
+}
+STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_step(const void* args, int args_size, void* out, int out_size) {
+    if (!g_stage || !g_stage->built) {
+        if (out) {
+            StrataStepOut* o = (StrataStepOut*) out;
+            std::memset(o, 0, sizeof(StrataStepOut));
+            std::snprintf(o->err, sizeof(o->err), "no built stage: strata_hip_stage_build comes first");
+        }
+        return -2;
+    }
+    return stage_step_into(args, args_size, out, out_size);
+}
+
+// The build: C.1's body up to and including its step-8 check, objects in the held stage.  The window, the
+// payload and the old card reading/prints are NOT here - the step and stage_measure_and_release keep them,
+// in the old order, so the one-call entry above measures exactly as C.1 measured.
+static int stage_build_into(const void* args, int args_size, void* out, int out_size) {
     if (args == nullptr || out == nullptr ||
         (int) sizeof(StrataStageArgs) != args_size || (int) sizeof(StrataStageOut) != out_size)
         return -1;                        // the two sides do not agree on the block: nothing is read
@@ -247,26 +360,17 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
 
     std::string err;
     int step = 1;
-    OwnDevice own;
-    OwnHost own_host;
-    float* hb = nullptr;            // the hand-off buffer, if the stage gets as far as owning one
-    float* hb_dev = nullptr;        // its device alias
+    g_stage = new StageHeld;                    // the held stage: every allocation from here belongs to it
+    OwnDevice& own = g_stage->own;
+    OwnHost& own_host = g_stage->own_host;
+    float*& hb = g_stage->hb;
+    float*& hb_dev = g_stage->hb_dev;
 
-    // ---- the window's ids, as the CLI writes them
-    std::vector<int32_t> toks;
-    for (const char* q = a.tokens; q != nullptr && *q != '\0'; ) {
-        char* end = nullptr;
-        const long long v = std::strtoll(q, &end, 10);
-        if (end == nullptr || end == q) break;
-        toks.push_back((int32_t) v);
-        q = end;
-        while (*q == ',' || *q == ' ') ++q;
-    }
+    // the window's ids are the STEP's now (half (b)): the build never looks at them, so a stage can be built
+    // once and replayed every window.  The buffer still holds kMaxT rows, as C.1 sized it.
     const int kMaxT = 8;                        // strata::kernels::kVerifyMaxT, include/strata/kernels/verify_kernels.hpp:21
-    const int T = toks.size() > (size_t) kMaxT ? kMaxT : (int) toks.size();
-    if (T < 1) return refuse(0, "no token ids in the args block");
 
-    strata::core::ModelGeometry g;
+    strata::core::ModelGeometry& g = g_stage->g;
     std::vector<std::string> shards;
     int64_t K = 0;
     try {
@@ -339,7 +443,8 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
         const bool hc_q8 = NativeDense::hc_q8_requested();    // auto = on for gfx12: mirror the AMD-only run
         if (hc_q8) NativeDense::add_hc_skip(a.pack, skip);
 
-        NativeEmbed embed;
+        g_stage->embed = std::make_unique<NativeEmbed>();
+        NativeEmbed& embed = *g_stage->embed;
         if (!embed.load(shards, g.n_embd, g.n_vocab, err)) return refuse(3, err);
         o->embed_bytes = (long long) embed.bytes();
         set_native_embed(&embed);                             // verify.cpp:1084 asks for it: an IQ row is not readable otherwise
@@ -350,7 +455,8 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
         if (hipMalloc(&arena, (size_t) pool_bytes) != hipSuccess) return refuse(10, "the pack's dense weights do not fit on this card");
         own.p.push_back(arena);
         o->arena_bytes = (long long) pool_bytes;
-        WeightTable wt;
+        g_stage->wt = std::make_unique<WeightTable>();
+        WeightTable& wt = *g_stage->wt;
         if (!wt.load(a.pack, arena, pool_bytes, err, &skip)) return refuse(3, err);
         // WeightTable::load_hc_q8 (the STRATA_HC_REQ8 shape, generate.cpp:3594 and :3649-3651) is NOT
         // mirrored: that env is unset on this rig, and the two shapes are alternatives - converting the
@@ -363,7 +469,8 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
         // ---- 4. the native projections of THIS stage's layers only (the rest belong to another stage)
         step = 4;
         NativeDense::set_layer_range((int) lb, (int) le);
-        NativeDense dense;
+        g_stage->dense = std::make_unique<NativeDense>();
+        NativeDense& dense = *g_stage->dense;
         if (!dense.load(shards, wt, err, true, lb, le)) return refuse(4, err);
         o->dense_bytes = (long long) dense.allocated_bytes();
 
@@ -375,7 +482,8 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
         if (hipMalloc(&sbuf, (size_t) sb) != hipSuccess) return refuse(10, "the session carve does not fit on this card");
         own.p.push_back(sbuf);
         o->session_bytes = (long long) sb;
-        SessionState ss;
+        g_stage->ss = std::make_unique<SessionState>();
+        SessionState& ss = *g_stage->ss;
         session_init(g, cells, K, sbuf, ss, lb, le);
         session_zero(ss, g, nullptr, nullptr);
 
@@ -384,7 +492,8 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
         const long long want = (le - lb) * g.n_expert;
         const long long n_slots = a.cache_slots > 0 ? a.cache_slots : want;
         if (n_slots < want) return refuse(6, "asked for fewer slots than the stage's experts: the window would need a CPU pool");
-        ExpertCache cache;
+        g_stage->cache = std::make_unique<ExpertCache>();
+        ExpertCache& cache = *g_stage->cache;
         if (!cache.open(n_slots, g.n_layers, g.n_expert, (int64_t) lay.max_blob, err)) return refuse(6, err);
         o->cache_bytes = cache.bytes();
         FileExpertSource src;
@@ -408,16 +517,17 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
 
         // ---- 7. the residency table the window's plans come from, and the Verifier that runs the stage
         step = 7;
-        std::vector<int32_t> host_res((size_t) g.n_layers * g.n_expert, kNotResident);
+        std::vector<int32_t>& host_res = g_stage->host_res;
+        host_res.assign((size_t) g.n_layers * (size_t) g.n_expert, kNotResident);
         for (long long l = lb; l < le; ++l)
             for (long long e = 0; e < g.n_expert; ++e)
                 host_res[(size_t) l * g.n_expert + e] = cache.slot_of(l, e);
-        int32_t* d_res = nullptr;
+        int32_t*& d_res = g_stage->d_res;
         if (hipMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != hipSuccess) return refuse(10, "the residency table does not fit");
         own.p.push_back(d_res);
         if (hipMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), hipMemcpyHostToDevice) != hipSuccess)
             return refuse(10, "the residency table would not upload");
-        VerifyHits vh;
+        VerifyHits& vh = g_stage->vh;
         vh.d_res = d_res;
         vh.h_res = host_res.data();
         vh.cache_base = cache.device_slot(0);
@@ -434,9 +544,15 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
         if (hipHostGetDevicePointer((void**) &hb_dev, hb, 0) != hipSuccess)
             return refuse(10, "the hand-off buffer has no device alias on this card");
 
-        Verifier ver;
+        g_stage->ver = std::make_unique<Verifier>();
+        Verifier& ver = *g_stage->ver;
         ver.set_stage(lb, le, nullptr, hb_dev);       // the FIRST stage: no hand-off in, and its own buffer out
         if (!ver.init(wt, g, ss, vh, nullptr, kMaxT, err)) return refuse(7, err);
+        g_stage->HB = (int) HB;                       // the step's payload size comes from here on
+        g_stage->n_layers = g.n_layers;
+        g_stage->lb = lb;
+        g_stage->le = le;
+        g_stage->device = o->device;
 
         // ---- 8. is the stage really all in VRAM?  If not, the window asks a host pool the join does not have.
         step = 8;
@@ -445,45 +561,99 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
             return refuse(8, "not every expert of the stage is in the VRAM tier: the window would ask a CPU expert "
                              "pool across the join, and that is C.5's, not something this gate may hide");
 
-        // ---- 9. the window itself: the graph this library's clang built for gfx1201 runs the stage
-        step = 9;
-        std::vector<int32_t> picks((size_t) T, 0);
-        const long long w0 = now_ms();
-        if (!ver.run(T, toks.data(), 0, nullptr, nullptr, picks.data(), err)) return refuse(9, err);
-        o->run_ms = (double) (now_ms() - w0);
-        o->window_runs = 1;
+        // the window is the STEP's now (half (b)): the build ends with its step-8 check above, HOLDING the
+        // stage, so a real run replays these graphs every window instead of rebuilding them.
+        g_stage->built = true;
         o->handoff_floats = (int) HB;
-        o->rows = kMaxT;
-        o->payload_bytes = (long long) T * HB * (long long) sizeof(float);
-
-        // the payload is in the library's mapped buffer: hash it HERE, so the caller can compare its own hash
-        // of ITS own copy of these bytes - two hashes, two sides, one measurement.
-        const long long floats = (long long) T * HB;
-        o->payload_hash = fnv1a64(hb, (size_t) (floats * (long long) sizeof(float)));
-        for (int i = 0; i < 8; ++i) {
-            o->first[i] = hb[i];
-            if (o->first[i] != o->first[i]) ++o->nan_count;      // a NaN is the only value not equal to itself
-        }
-        o->read_back_ok = 1;
-
-        set_native_embed(nullptr);            // the embedding is about to leave: the process-wide pointer must not dangle
-        NativeDense::set_layer_range(-1, -1); // the process-wide range too
+        o->rows = 8;                          // kMaxT: the buffer's capacity
+        o->build_s = (double) (now_ms() - t_build0) / 1000.0;
+        {
+            size_t held_total = 0;
+            hipMemGetInfo(&o->free_after, &held_total);   // the card WHILE the stage is held: what a decode would
+        }                                                 //   start from
+        return 0;
     } catch (const std::exception& e) {
         return refuse(step, e.what());
     }
+}
 
-    // the stage's objects are gone: what is measured is the card again, so "the stage was built" cannot be silent
-    hipMemGetInfo(&o->free_after, &total);
-    o->build_s = (double) (now_ms() - t_build0) / 1000.0;
+// One window replayed on the HELD stage: the ids cross in, the payload's bytes get hashed HERE (the C.1 rule,
+// per window), and the caller takes them through strata_hip_stage_payload as before.
+static int stage_step_into(const void* args, int args_size, void* out, int out_size) {
+    if (args == nullptr || out == nullptr ||
+        (int) sizeof(StrataStepArgs) != args_size || (int) sizeof(StrataStepOut) != out_size)
+        return -1;                        // the two sides do not agree on the block: nothing is read
+    const StrataStepArgs& a = *(const StrataStepArgs*) args;
+    StrataStepOut* o = (StrataStepOut*) out;
+    std::memset(o, 0, sizeof(StrataStepOut));
+    if (!g_stage || !g_stage->built) {
+        std::snprintf(o->err, sizeof(o->err), "no built stage: strata_hip_stage_build comes first");
+        return -2;
+    }
+    release_payload();                    // the last window's payload is not carried into this one
+    std::vector<int32_t> toks;
+    for (const char* q = a.tokens; q != nullptr && *q != '\0'; ) {
+        char* end = nullptr;
+        const long long v = std::strtoll(q, &end, 10);
+        if (end == nullptr || end == q) break;
+        toks.push_back((int32_t) v);
+        q = end;
+        while (*q == ',' || *q == ' ') ++q;
+    }
+    const int kMaxT = 8;                  // strata::kernels::kVerifyMaxT, as the build sized the buffer
+    const int T = toks.size() > (size_t) kMaxT ? kMaxT : (int) toks.size();
+    if (T < 1) {
+        std::snprintf(o->err, sizeof(o->err), "no token ids in the step block");
+        return -100;
+    }
+    auto& gs = *g_stage;
+    std::vector<int32_t>& picks = gs.picks;
+    picks.assign((size_t) T, 0);
+    std::string err;
+    const long long w0 = now_ms();
+    if (!gs.ver->run(T, toks.data(), 0, nullptr, nullptr, picks.data(), err)) {
+        std::snprintf(o->err, sizeof(o->err), "%s", err.c_str());
+        std::fprintf(stderr, "strata hip engine: the step refused: %s\n", err.c_str());
+        return -109;
+    }
+    o->run_ms = (double) (now_ms() - w0);            // raw ms, as C.1's window was timed
+    o->wait_ms = gs.last_step_ms ? (double) (w0 - gs.last_step_ms) : 0.0;
+    gs.last_step_ms = now_ms();
+    o->steps_total = ++gs.steps;
+    o->rows = T;
+    const long long floats = (long long) T * gs.HB;
+    o->payload_bytes = floats * (long long) sizeof(float);
+    o->payload_hash = fnv1a64(gs.hb, (size_t) (floats * (long long) sizeof(float)));
     g_payload.held = true;
-    g_payload.host = hb;
-    g_payload.dev = hb_dev;
-    g_payload.floats = (long long) T * Verifier::handoff_floats(g);
-    own_host.keep = true;
+    g_payload.host = gs.hb;
+    g_payload.dev = gs.hb_dev;
+    g_payload.floats = floats;
+    std::fprintf(stderr, "strata hip engine:   step %lld on the held stage: %d rows, %lld B of hand-off, the "
+                         "library's hash %016llx, the window %.1f ms, %0.1f ms since the last one ended\n",
+                 (long long) o->steps_total, o->rows, (long long) o->payload_bytes, o->payload_hash,
+                 o->run_ms, o->wait_ms);
+    return 0;
+}
 
+// C.1's last act, kept in the old order for the one-call entry: the stage's objects let go first (their own
+// hipFrees), THEN the card is read with the arena and the session carve STILL held (own gives them back at
+// the delete below, where the old body gave them back at return), then the old prints.  The pinned hand-off
+// stays because the payload still owes it to the caller.
+static void stage_measure_and_release(StrataStageOut* o) {
+    g_stage->ver.reset();
+    g_stage->cache.reset();
+    g_stage->ss.reset();
+    g_stage->dense.reset();
+    g_stage->embed.reset();
+    g_stage->wt.reset();
+    strata::core::set_native_embed(nullptr);   // the embedding is about to leave: the process-wide pointer must not dangle
+    strata::core::NativeDense::set_layer_range(-1, -1);  // the process-wide range too
+    size_t total = 0;
+    hipMemGetInfo(&o->free_after, &total);    // the stage's objects are gone: "built" cannot be silent
+    g_stage->own_host.keep = true;      // the payload's buffer: owed to the caller until it has copied it
     std::fprintf(stderr, "strata hip engine: the stage ran INSIDE the library on device %d of %d AMD cards, arches %s: "
-                         "layers [%lld, %lld) of %lld\n", o->device, o->hip_devices, o->archs, (long long) lb,
-                         (long long) le, (long long) g.n_layers);
+                         "layers [%lld, %lld) of %lld\n", o->device, o->hip_devices, o->archs,
+                         g_stage->lb, g_stage->le, g_stage->n_layers);
     std::fprintf(stderr, "strata hip engine:   the weights took %.3f GiB of arena + %.3f GiB of native projections "
                          "(this stage only) + %.3f GiB of Q8 hyper-connections; the expert tier %.3f GiB, %d experts; "
                          "the session carve %.3f MiB; the token table %.1f MiB of host\n",
@@ -500,7 +670,7 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
                          o->handoff_floats, o->rows,
                          (o->handoff_floats > 0 ? o->payload_bytes / ((long long) o->handoff_floats * (long long) sizeof(float)) : 0LL),
                          o->payload_bytes, o->payload_hash);
-    return 0;
+    stage_delete_partial();               // the arena and the session carve go back to the card here
 }
 
 // Take the payload into RAM the CALLER owns.  The library's mapped buffer is its own: the CUDA engine never
@@ -511,8 +681,9 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_payload(float* dst, int dst_floats
     if (dst == nullptr || !g_payload.held || dst_floats < 1) return -1;
     const long long n = g_payload.floats < (long long) dst_floats ? g_payload.floats : (long long) dst_floats;
     std::memcpy(dst, g_payload.host, (size_t) n * sizeof(float));
-    release_payload();
-    return (int) n;
+    if (g_stage && g_payload.host == g_stage->hb) g_stage->own_host.keep = true;  // the held stage's pinned buffer:
+    release_payload();                                                            // freed here, and stage_free must not
+    return (int) n;                                                               // free it a second time
 }
 
 // ================================ C.4: ONE ARENA PER RUNTIME ================================

@@ -38,6 +38,7 @@ int main(int argc, char** argv) {
     // C.1's gate: the stage needs a model, so the paths and the range are asked for, with the shape's
     // defaults around them (one layer, 1024 cells, hip:0, and the ids the daily run uses).
     bool probe_stage = false;
+    bool probe_stage2 = false;
     std::string stage_pack, stage_native, stage_tokens = "248045,846";
     long long stage_layers = 1, stage_context = 1024;
     int stage_device = 0;
@@ -62,6 +63,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--stage-hold") == 0) stage_hold = true;
 #ifdef STRATA_MULTI_BRAND
         else if (std::strcmp(argv[i], "--probe-stage") == 0) probe_stage = true;
+        else if (std::strcmp(argv[i], "--probe-stage2") == 0) probe_stage2 = true;
         else if (i + 1 < argc && std::strcmp(argv[i], "--stage-pack") == 0) stage_pack = argv[++i];
         else if (i + 1 < argc && std::strcmp(argv[i], "--stage-native") == 0) stage_native = argv[++i];
         else if (i + 1 < argc && std::strcmp(argv[i], "--stage-tokens") == 0) stage_tokens = argv[++i];
@@ -282,6 +284,23 @@ int main(int argc, char** argv) {
         a.cache_slots = 0;              // every expert of the stage: the window must not ask a CPU pool across the join
         a.device = stage_device;
         return strata::core::stage_run_gate(a) ? 0 : 3;
+    }
+    if (probe_stage2) {
+        if (stage_pack.empty() || stage_native.empty()) {
+            std::fprintf(stderr, "strata-device: --probe-stage2 needs --stage-pack DIR and --stage-native SHARD1\n");
+            return 2;
+        }
+        StrataStageArgs a{};
+        auto put = [](char* dst, size_t n, const std::string& s) { std::snprintf(dst, n, "%s", s.c_str()); };
+        put(a.pack, sizeof a.pack, stage_pack);
+        put(a.native, sizeof a.native, stage_native);
+        put(a.tokens, sizeof a.tokens, stage_tokens);
+        a.lb = 0;                       // the FIRST stage: hand_in is null, and that is only legal at layer 0
+        a.le = stage_layers;
+        a.max_context = stage_context;
+        a.cache_slots = 0;              // every expert of the stage: the window must not ask a CPU pool across the join
+        a.device = stage_device;
+        return strata::core::stage_persist_gate(a) ? 0 : 3;
     }
 #endif
 
