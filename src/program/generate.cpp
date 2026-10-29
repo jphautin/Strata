@@ -3033,6 +3033,30 @@ int main(int argc, char** argv) {
                                  "layers [0,%s), host native %s-and-up + head + sampler on this runtime; the "
                                  "serve wiring across the join = the next cut, refused before any model load\n",
                          card_id(split_cards[0]).c_str(), o.layer_split.c_str(), o.layer_split.c_str());
+            // S5 (unit 2c1): the honest SHAPE rules a mixed serve will obey from its first run - checked NOW so
+            // a shape that can never be wired is refused by NAME, never by a later crash. A held library stage
+            // replays ONE window (kVerifyMaxT rows): a prompt longer than it would need prefill ACROSS the join.
+            // A drafter (--spec>0/--mtp) writes a tree of rows: the LIBRARY stage must replay that tree too -
+            // plain decode first, measured, before any tree crosses.
+            if (o.tokens.size() > (size_t) strata::kernels::kVerifyMaxT) {
+                std::fprintf(stderr, "strata generate: mixed shape: the prompt runs %zu ids, over the ONE window "
+                                     "a held library stage replays (%d): PREFILL-ACROSS-THE-JOIN stays refused "
+                                     "until a library prefill shape exists\n",
+                             o.tokens.size(), (int) strata::kernels::kVerifyMaxT);
+                return 2;
+            }
+            if (o.spec > 0 || !o.mtp.empty()) {
+                std::fprintf(stderr, "strata generate: mixed shape: --spec %d (--mtp %s) asks a DRAFTER whose "
+                                     "draft tree would cross the join through the library's windows: DRAFTER-ACROSS-"
+                                     "THE-JOIN stays refused until the plain mixed serve runs first\n",
+                             o.spec, o.mtp.c_str());
+                return 2;
+            }
+            std::fprintf(stderr, "strata generate: mixed shape checks PASS: the prompt's %zu ids FIT one window "
+                                 "(the library's step shape answers it as C.1 ran), no drafter asked; the serve "
+                                 "WIRING (skip main's native stage-0 build + per-window library step at session "
+                                 "positions) = the next cut\n",
+                         o.tokens.size());
             return 2;
         }
         for (const int d : used_slots) {
