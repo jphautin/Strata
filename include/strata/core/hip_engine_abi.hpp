@@ -165,6 +165,9 @@ struct StrataStageOut {
 // per-token contract the mixed serve needs, and one call per window keeps each window's payload measurable.
 struct StrataStepArgs {
     char tokens[128];      // the window's ids, comma-separated as --tokens writes them (8 ids of 6 digits fit)
+    long long pos;         // v5.1: where the window SITS in the session - C.1 hard-coded 0 (one-call per window:
+                           // a fresh build always sits at 0). A HELD stage must answer windows at increasing
+                           // positions: the mixed serve's per-token shape carries the position now.
 };
 
 // What ONE step measured: the rows it ran, the payload's size and hash (the LIBRARY's own FNV over the bytes
@@ -260,7 +263,7 @@ bool stage_persist_gate(const StrataStageArgs& args);   // half (b): build once 
 // (out, when given, is the caller's own StrataStageOut reading); step: floats copied (>0) or negative, with
 // the window's report in `report` when the caller wants it; free releases the held stage.
 bool engine_stage_build(const StrataStageArgs& args, StrataStageOut* out);
-long long engine_stage_step(const char* tokens, float* payload_out, int payload_floats, StrataStepOut* report);
+long long engine_stage_step(const char* tokens, long long pos, float* payload_out, int payload_floats, StrataStepOut* report);
 void engine_stage_free();
 
 // C.4's measurement: ONE arena per runtime, not one arena per process.  The host holds its OWN DeviceArena

@@ -559,7 +559,7 @@ bool engine_stage_build(const StrataStageArgs& args, StrataStageOut* out) {
     return true;                                        // the stage is HELD inside the library now
 }
 
-long long engine_stage_step(const char* tokens, float* payload_out, int payload_floats, StrataStepOut* report) {
+long long engine_stage_step(const char* tokens, long long pos, float* payload_out, int payload_floats, StrataStepOut* report) {
     static const auto step_fn = (strata_hip_stage_step_fn) sym(engine_lib().h, "strata_hip_stage_step");
     static const auto take_fn = (strata_hip_stage_payload_fn) sym(engine_lib().h, "strata_hip_stage_payload");
     if (step_fn == nullptr || take_fn == nullptr) {
@@ -568,6 +568,7 @@ long long engine_stage_step(const char* tokens, float* payload_out, int payload_
     }
     StrataStepArgs sa{};
     std::snprintf(sa.tokens, sizeof(sa.tokens), "%s", tokens ? tokens : "");
+    sa.pos = pos;                                       // v5.1: the window SITS somewhere - a serve's position grows
     StrataStepOut dummy{};
     StrataStepOut& r = report ? *report : dummy;
     if (report == nullptr) std::memset(&dummy, 0, sizeof(dummy));
@@ -634,17 +635,21 @@ bool stage_persist_gate(const StrataStageArgs& args) {
         return h;
     };
 
-    StrataStepArgs sa{};
-    std::snprintf(sa.tokens, sizeof(sa.tokens), "%s", args.tokens);   // the same window, replayed twice
-
+    // v5.1 (unit 2b1b): THREE windows on the ONE held stage, each at its own POSITION: w1 and w2 = the same ids
+    // at pos 0 - the hard check that a held stage replays the SAME ask with the SAME payload (C.1 could not show
+    // a stale window because it rebuilt); w3 = the SAME ids at pos 2 - INFORMATIONAL: the payload moving is proof
+    // the session depth reaches across the join; staying says so honestly. Every window still crosses two-sided.
     bool ok = true;
-    bool got1 = false;
-    unsigned long long hash1 = 0;
-    for (int w = 0; w < 2; ++w) {
+    unsigned long long hash1 = 0, hash3 = 0;
+    for (int w = 0; w < 3; ++w) {
+        StrataStepArgs sa{};
+        std::snprintf(sa.tokens, sizeof(sa.tokens), "%s", args.tokens);
+        const long long pos = w < 2 ? 0 : 2;            // SAME ids: only the POSITION can move the answer
+        sa.pos = pos;
         StrataStepOut so{};
         const long long cap = (long long) o.handoff_floats * 8;   // kVerifyMaxT rows of this stage's hand-off
         std::vector<float> host((size_t) cap, 0.0f);
-        const long long got = engine_stage_step(sa.tokens, host.data(), (int) cap, &so);
+        const long long got = engine_stage_step(sa.tokens, pos, host.data(), (int) cap, &so);
         if (got < 0) {
             std::fprintf(stderr, "strata: the persisted-stage gate refused at window %d: %s\n", w + 1, so.err);
             ok = false;
@@ -661,22 +666,36 @@ bool stage_persist_gate(const StrataStageArgs& args) {
         }
         if (w == 0) {
             hash1 = here;
-            got1 = true;
-        } else if (got1 && here != hash1) {
-            std::printf("persist: the two replays differ at the payload: the session moved between windows - "
-                        "information only, the decode does not demand they agree\n");
+        } else if (w == 1) {
+            if (here != hash1) {                        // v5.1 HARD CHECK: same ids, same pos = same payload
+                std::fprintf(stderr, "strata: the SAME window at the SAME position answered twice differently: "
+                                     "%016llx then %016llx: the held stage is not replaying what it was asked\n",
+                             hash1, here);
+                ok = false;
+                break;
+            }
+        } else {
+            hash3 = here;
+            if (hash3 != hash1)
+                std::printf("pos: the SAME ids at position 2 answer DIFFERENTLY from position 0 (%016llx against "
+                            "%016llx): the session depth IS in the payload - the position matters across the join\n",
+                            hash3, hash1);
+            else
+                std::printf("pos: the SAME ids at position 2 answer the SAME as at position 0 (%016llx): this "
+                            "stage's payload does not depend on the position for this window - as measured\n",
+                            hash3);
         }
-        std::printf("persist: window %d of the HELD stage: %lld B of hand-off back in RAM I own, both sides "
+        std::printf("persist: window %d of the HELD stage at position %lld: %lld B of hand-off back in RAM I own, both sides "
                     "hash %016llx, the window %.1f ms (%.1f ms since the last ended - the load is NOT in here)\n",
-                    w + 1, (long long) so.payload_bytes, here, so.run_ms, so.wait_ms);
+                    w + 1, pos, (long long) so.payload_bytes, here, so.run_ms, so.wait_ms);
         std::fflush(stdout);
     }
     engine_stage_free();                                // the held stage goes back; the card is free again
 
     std::fprintf(stderr, "strata: persisted-stage gate: %s.  One stage built inside the HIP-built library "
-                         "answered TWO windows without being rebuilt: both windows' payload bytes hashed the "
-                         "same on the library's side and on this process's side, and the library says which "
-                         "step each window was\n", ok ? "PROVEN" : "NOT PROVEN");
+                         "answered THREE windows at their POSITIONS without being rebuilt: every window's payload "
+                         "bytes hashed the same on the library's side and on this process's side, the SAME window "
+                         "at the SAME position answered the SAME twice, and the library says where and which step\n", ok ? "PROVEN" : "NOT PROVEN");
     return ok;
 }
 

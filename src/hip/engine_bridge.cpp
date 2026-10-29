@@ -282,6 +282,7 @@ STRATA_HIP_ENGINE_EXPORT int strata_hip_stage_run(const void* args, int args_siz
     if (b != 0) return b;
     const StrataStageArgs& a = *(const StrataStageArgs*) args;
     StrataStepArgs sa;                    // the same window's ids the args block named, as C.1 ran them
+    std::memset(&sa, 0, sizeof(sa));      // v5.1: the fresh build sits at position 0 - C.1's shape, exactly
     std::snprintf(sa.tokens, sizeof(sa.tokens), "%s", a.tokens);
     StrataStepOut so;
     std::memset(&so, 0, sizeof(so));
@@ -611,7 +612,7 @@ static int stage_step_into(const void* args, int args_size, void* out, int out_s
     picks.assign((size_t) T, 0);
     std::string err;
     const long long w0 = now_ms();
-    if (!gs.ver->run(T, toks.data(), 0, nullptr, nullptr, picks.data(), err)) {
+    if (!gs.ver->run(T, toks.data(), (int) a.pos, nullptr, nullptr, picks.data(), err)) {
         std::snprintf(o->err, sizeof(o->err), "%s", err.c_str());
         std::fprintf(stderr, "strata hip engine: the step refused: %s\n", err.c_str());
         return -109;
@@ -628,9 +629,9 @@ static int stage_step_into(const void* args, int args_size, void* out, int out_s
     g_payload.host = gs.hb;
     g_payload.dev = gs.hb_dev;
     g_payload.floats = floats;
-    std::fprintf(stderr, "strata hip engine:   step %lld on the held stage: %d rows, %lld B of hand-off, the "
+    std::fprintf(stderr, "strata hip engine:   step %lld on the held stage at position %lld: %d rows, %lld B of hand-off, the "
                          "library's hash %016llx, the window %.1f ms, %0.1f ms since the last one ended\n",
-                 (long long) o->steps_total, o->rows, (long long) o->payload_bytes, o->payload_hash,
+                 (long long) o->steps_total, (long long) a.pos, o->rows, (long long) o->payload_bytes, o->payload_hash,
                  o->run_ms, o->wait_ms);
     return 0;
 }
