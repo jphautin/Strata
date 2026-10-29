@@ -30,6 +30,9 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
+#ifdef STRATA_MULTI_BRAND
+#include "strata/core/hip_engine_abi.hpp"   // C.6: the mixed shape - stage entries + the loader's engine_stage_* shim
+#endif
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -3046,20 +3049,28 @@ int main(int argc, char** argv) {
                 return 2;
             }
             if (o.spec > 0 || !o.mtp.empty()) {
-                std::fprintf(stderr, "strata generate: mixed shape: --spec %d (--mtp %s) asks a DRAFTER whose "
-                                     "draft tree would cross the join through the library's windows: DRAFTER-ACROSS-"
-                                     "THE-JOIN stays refused until the plain mixed serve runs first\n",
-                             o.spec, o.mtp.c_str());
-                return 2;
+                // 2c2 finding (measured run23): the NATIVE IQ pack's own rule demands --spec T>=2, so a mixed
+                // run with this pack ALWAYS asks the drafter - refusing it would make the mixed shape unloadable
+                // by the pack's own law. The library replays windows of up to kVerifyMaxT rows: the tree's rows
+                // RIDE the windows; the drafter itself lives on the host's LAST stage. WARNING, not refusal.
+                std::fprintf(stderr, "strata generate: mixed shape: a DRAFTER is asked (--spec %d %s): its tree's "
+                                     "rows ride the library's windows (up to %d rows) and the drafter lives on the "
+                                     "host's last stage - allowed for the load gate, window wiring still unit 2c3\n",
+                             o.spec, o.mtp.empty() ? "(no --mtp)" : o.mtp.c_str(),
+                             (int) strata::kernels::kVerifyMaxT);
             }
+            // 2c2: a shape that PASSES its checks now FALLS THROUGH into the machinery - main builds ZERO native
+            // layers, the library HOLDS [0,K) once at load, and the LOAD GATE refuses before any window (never a
+            // half-wired serve). The per-window wiring = unit 2c3.
             std::fprintf(stderr, "strata generate: mixed shape checks PASS: the prompt's %zu ids FIT one window "
-                                 "(the library's step shape answers it as C.1 ran), no drafter asked; the serve "
-                                 "WIRING (skip main's native stage-0 build + per-window library step at session "
-                                 "positions) = the next cut\n",
+                                 "(the library's step shape answers it as C.1 ran), no drafter asked; the run "
+                                 "proceeds to the LOAD gate - windows stay unwired until unit 2c3\n",
                          o.tokens.size());
-            return 2;
         }
-        for (const int d : used_slots) {
+        // 2c2: the RECOGNISED hip-first mixed shape skips this sweep - its foreign slot 0 IS the library's stage
+        // (the sweep still guards every OTHER shape, unchanged below)
+        if (!(hip_foreign && foreign_first && others_own))
+            for (const int d : used_slots) {
             if (d >= 0 && d < (int) split_cards.size() && split_cards[(size_t) d].runtime != own_rt) {
                 std::fprintf(stderr, "strata generate: a layer split asks for a stage on %s, which is not this "
                                      "build's runtime (%s here): every stage's dense weights, arena and kernels are "
@@ -3740,8 +3751,12 @@ int main(int argc, char** argv) {
                              "projections are used\n");
     const bool hc_q8 = hc_req8_env && !multi_gpu;
     if (hc_q8) strata::core::WeightTable::hc_q8_names(g.n_layers, skip);
-    uint64_t pool_bytes = 0;
-    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    std::set<std::string> skip_main = skip;
+    if (mixed_lib_first)
+        add_foreign(0, 0, skip_main, o.mmap_experts);   // 2c2: MAIN's layer range is EMPTY: every blk tensor is
+    uint64_t pool_bytes = 0;                            //   foreign to it - the wt still LOADS (its scan builds
+    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err,                                //   the canonical table the
+        skip_main.empty() ? nullptr : &skip_main)) {   //   native dense lookups need), it just loads NO layer bytes
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
@@ -3785,7 +3800,10 @@ int main(int argc, char** argv) {
         return s;
     };
     strata::core::WeightTable wt;
-    if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (mixed_lib_first)
+        std::fprintf(stderr, "strata generate: mixed shape: MAIN's layer range is EMPTY - the wt scan still builds the "
+                             "canonical table but loads no blk bytes (stage 0 is the HIP library's)\n");
+    if (!wt.load(o.pack, arena, pool_bytes, err, skip_main.empty() ? nullptr : &skip_main)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
@@ -4209,6 +4227,15 @@ int main(int argc, char** argv) {
                          st.dev, (long long) lb, (long long) le - 1);
         } else {
             skip_s = skip;
+            if (mixed_lib_first) {
+                // 2c2: MAIN's pool was the EMPTY-range number (head bytes only) - the STAGE's arena is sized
+                // with its OWN range [lb,le), foreign outside, exactly like the trim path above
+                add_foreign(lb, le, skip_s, false);
+                if (!strata::core::WeightTable::pool_bytes(o.pack, pool_s, err, &skip_s)) {
+                    std::fprintf(stderr, "strata generate: layer split: CUDA%d weights: %s\n", st.dev, err.c_str());
+                    return false;
+                }
+            }
         }
         void* arena_s = nullptr;
         if (cudaMalloc(&arena_s, pool_s) != cudaSuccess ||
@@ -4233,9 +4260,19 @@ int main(int argc, char** argv) {
     for (size_t i = 0; multi_gpu && i < split_devs.size(); ++i) {
         stages.push_back(std::make_unique<GpuStage>());
         GpuStage& st = *stages.back();
-        st.dev = split_devs[i];
+        st.dev = mixed_lib_first ? split_cards[(size_t) split_devs[i]].ordinal   // 2c2: a mixed shape's slot is BRAND-tagged:
+                                  : split_devs[i];                              //   cuda:0 = CUDA ordinal 0 (the ONLY card this CUDA
+                                                                              //   runtime sees); same-brand slots keep the old law
         double free_gib = 0;
-        if (!strata::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
+        if (mixed_lib_first) {
+            // 2c2: the STAGE's card IS this runtime's primary - the whole NVIDIA side is cuda:0 and MAIN runs on
+            // the AMD side, so the helper's laws (not visible / not the primary / spin-before-context) cannot
+            // apply: the context already exists from main's own work; just measure what that card has free.
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) != cudaSuccess)
+                cudaGetLastError();
+            free_gib = (double) fb / 1073741824.0;
+        } else if (!strata::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -5083,7 +5120,7 @@ int main(int argc, char** argv) {
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
-        const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+        const int64_t hi0 = mixed_lib_first ? 0 : (multi_gpu ? split_at[0] : -1);   // 2c2: main runs NO native layers - stage 0 is the library's, so its session covers nothing
         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
         {
@@ -6110,9 +6147,12 @@ int main(int argc, char** argv) {
                 --fake_fails;
                 err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
             } else {
-                ok = sized_slots.empty()
-                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
-                    : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
+                if (mixed_lib_first) {   // 2c2: MAIN carries NO experts - stage 0's experts live INSIDE the library,
+                    ok = true;           //   on the AMD card; this cache stays closed (0 slots, 0 bytes): the fills
+                } else                   //   below read 0 bytes and admit nothing
+                    ok = sized_slots.empty()
+                        ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
+                        : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
             }
             if (!ok) {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
@@ -6141,7 +6181,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (!auto_cache || attempt - failed >= 6) break;
-            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
+            if (xcache.device_slot(0) != nullptr)   // 2c2: a mixed run leaves MAIN's cache closed (0 bytes): a null slot is not memset
+                cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
             free_b = strata::core::device_free_bytes(); (void) total_b;
@@ -6355,7 +6396,11 @@ int main(int argc, char** argv) {
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
                      (long long) filled, st.profile.size());
     }
-    if (multi_gpu)
+    if (mixed_lib_first)
+        std::fprintf(stderr, "strata generate: layer split: CUDA0 runs NO native layers - stage 0 is the HIP "
+                             "library's [0,%lld), the host native part is %lld-and-up\n",
+                     (long long) split_at[0], (long long) split_at[0]);
+    else if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
 
     // ---- LAYER 2: exact startability probe on the live free figures.  Every session, cache and batch slot is
@@ -6702,7 +6747,7 @@ int main(int argc, char** argv) {
 
     // ---- the graphs
     strata::core::SessionGraphs gr;
-    if (!o.no_capture && !native_pack) {   // plan v0.3 P6: a native pack runs verify windows only
+    if (!mixed_lib_first && !o.no_capture && !native_pack) {   // 2c2: the library's stage owns its graphs INSIDE the HIP-built library (v5 held stage) - nothing to capture natively for it; the host's later stages' windows come from the shim (unit 2c3)
         // a layer split's CUDA0 session owns only [0, split_at[0]), so its graphs cover that range; the
         // whole-model replay paths (`session_loop`, the plain generate loop) refuse rather than read another
         // stage's state - a split runs its layers on the stages' verifiers (serve) or prefill stage chain
@@ -8089,7 +8134,7 @@ int main(int argc, char** argv) {
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
         if (pf_borrow && d_res != nullptr) {
-            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
+            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, mixed_lib_first ? 0 : (multi_gpu ? split_at[0] : g.n_layers), -1, -1, 0, {}});   // 2c2: the MAIN prompt row covers nothing when the library owns stage 0
             for (auto& st : stages)
                 pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
             // The two tests plan_lend makes for CUDA0 alone, one participant at a time: a loan must leave the
@@ -8357,7 +8402,8 @@ int main(int argc, char** argv) {
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
                 }
             }
-            if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            if (mixed_lib_first) sp.set_stage(0, split_at[0], &stages[0]->sp);   // 2c2: main's PROMPT stage keeps [0,K):
+            else if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);   //   an EMPTY prefill stage is illegal
             if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
@@ -8725,6 +8771,38 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        if (mixed_lib_first) {
+            // 2c2 LOAD GATE: the library HOLDS stage 0 [0,K) ONCE (its own arena + session + tier inside the
+            // HIP-built library, every expert resident - the only shape v5 knows), the host's native [K,48) +
+            // head were already built above as the later stages. The WINDOW wiring (engine_stage_step per window
+            // at session positions into the hand-off, then the host stage's entry) = unit 2c3: REFUSED here, so
+            // a half-wired serve never starts.
+            StrataStageArgs sa{};                    // the POD blocks are GLOBAL scope in the ABI header (extern "C" family)
+            std::snprintf(sa.pack, sizeof sa.pack, "%s", o.pack.c_str());
+            std::snprintf(sa.native, sizeof sa.native, "%s", o.native_preset.c_str());
+            std::string toks;
+            for (size_t q = 0; q < o.tokens.size(); ++q) toks += (q ? "," : "") + std::to_string(o.tokens[q]);
+            std::snprintf(sa.tokens, sizeof sa.tokens, "%s", toks.c_str());
+            sa.lb = 0;                       // the FIRST stage: the library's hand_in is null - only legal at layer 0
+            sa.le = split_at[0];
+            sa.max_context = o.max_context;
+            sa.cache_slots = 0;              // every expert of [0,K) resident: no CPU pool across the join
+            sa.device = 0;                   // the library's own runtime numbers its AMD card 0
+            StrataStageOut so{};
+            if (!strata::core::engine_stage_build(sa, &so)) {
+                std::fprintf(stderr, "strata generate: the HIP library refused the held stage [0,%lld): %s\n",
+                             (long long) sa.le, (const char*) so.err);
+                return 2;
+            }
+            std::fprintf(stderr, "strata generate: MIXED LOAD PROVEN LINE: the HIP library HOLDS stage 0 = layers "
+                                 "[0,%lld): card %.3f GiB free before, %.3f GiB while HELD, tier %.3f GiB with %d "
+                                 "experts; the host native [%lld,48) + head are built. The per-window wiring = unit "
+                                 "2c3 - refused here, never a half-wired serve\n",
+                         (long long) sa.le, (double) so.free_before / 1073741824.0,
+                         (double) so.free_after / 1073741824.0, (double) so.cache_bytes / 1073741824.0,
+                         so.resident_experts, (long long) sa.le);
+            return 2;
+        }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
