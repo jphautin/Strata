@@ -2760,6 +2760,9 @@ int main(int argc, char** argv) {
     std::vector<int> split_devs;   // the later stages' cards: a SLOT in split_cards (the block below)
     std::vector<strata::core::DeviceInfo> split_cards;   // the cards ONE process can place a stage on
     bool split_auto = false, split_same = false;
+    bool mixed_lib_first = false;   // half (b) unit 2b: the ONE legal mix shape - foreign card FIRST (stage 0 =
+                                    // the LIBRARY's [0,K), lb=0; the rest this runtime, native); set by the
+                                    // RECOGNITION below (:3005). Wiring (skip main's native build + shim per window) = the cut after this one
     auto card_id = [](const strata::core::DeviceInfo& c) {
         return c.runtime == strata::core::DeviceRuntime::HIP
                    ? "hip:" + std::to_string(c.ordinal)
@@ -3008,6 +3011,30 @@ int main(int argc, char** argv) {
             hip_build ? strata::core::DeviceRuntime::HIP : strata::core::DeviceRuntime::CUDA;
         std::vector<int> used_slots = {0};
         for (const int d : split_devs) used_slots.push_back(d);
+        // half (b) unit 2b (S2): the ONE legal shape across the join is the foreign card FIRST - stage 0 (the
+        // main machinery's slot below) = the HIP library's [0,K) (lb=0, the only shape v5's entry builds),
+        // every OTHER stage slot this runtime: native [K,48) + head + sampler reading the library's payload
+        // as its hand-in. Recognition is honest: the shape prints, then REFUSES until the wiring (unit 2b1b:
+        // skip main's native build + engine_stage_build once, per-window engine_stage_step into hand[0]) lands.
+        // Any other mix (foreign stage NOT first, foreign in the HIP build = no NVIDIA library exists) keeps the refusal below.
+        bool foreign_first = false, others_own = true;
+        for (const int d : used_slots) {
+            const bool foreign = d >= 0 && d < (int) split_cards.size() &&
+                                 split_cards[(size_t) d].runtime != own_rt;
+            if (d == 0) foreign_first = foreign;
+            else if (foreign) others_own = false;
+        }
+        const bool hip_foreign =
+            own_rt == strata::core::DeviceRuntime::CUDA &&
+            (!split_cards.empty() && split_cards[0].runtime == strata::core::DeviceRuntime::HIP);
+        if (foreign_first && others_own && hip_foreign) {
+            mixed_lib_first = true;
+            std::fprintf(stderr, "strata generate: mixed shape RECOGNISED: stage 0 on %s = the HIP library's "
+                                 "layers [0,%s), host native %s-and-up + head + sampler on this runtime; the "
+                                 "serve wiring across the join = the next cut, refused before any model load\n",
+                         card_id(split_cards[0]).c_str(), o.layer_split.c_str(), o.layer_split.c_str());
+            return 2;
+        }
         for (const int d : used_slots) {
             if (d >= 0 && d < (int) split_cards.size() && split_cards[(size_t) d].runtime != own_rt) {
                 std::fprintf(stderr, "strata generate: a layer split asks for a stage on %s, which is not this "
