@@ -665,7 +665,12 @@ def with_current_reader(cfg: dict, package: Path) -> dict:
             # (components/engine/<version>-...) is the engine's reader from before the update, and the engine in use has its own
             older = (not gone and Path(old).parent != package and Path(old).parent.parent == package.parent
                      and package.parent.name.lower() == "engine")
-            if (gone or older) and new.is_file():
+            # a reader that sits in an engine package of ANOTHER make, in a section that names its card, is a choice and not a stale
+            # path: the encoder runs on a card of that make while the engine drives its own, so moving it onto the engine in use
+            # would swap in a program that has no code for that card (it says so and the picture falls back to the processor)
+            deliberate = (older and fixed.get("cuda_device") is not None
+                          and engine_component.package_make(Path(old).parent) != engine_component.package_make(package))
+            if (gone or (older and not deliberate)) and new.is_file():
                 print(f"[strata] the picture reader {old} " + ("is not there any more" if gone else "belongs to an older engine")
                       + f"; using {new} from the engine package in use", flush=True)
                 fixed[key] = str(new)

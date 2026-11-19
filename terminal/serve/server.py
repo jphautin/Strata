@@ -3795,17 +3795,25 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
     keeps all of its own cards' VRAM (#408, Efs-O).  The section's own "env" goes on top, for the encoder alone: the config's
     top-level "env" reaches the encoder too, so a setting meant only for it (#4668: {"GPU_MAX_HW_QUEUES": "1"}, when the encoder
     shares a gfx1030 card with the engine and their compute queues together exceed the 8 the kernel gives that card) would
-    otherwise cap the engine as well.  Without either, nothing changes."""
+    otherwise cap the engine as well.  The card variable belongs to the reader program's own family, not to the engine's:  a CUDA reader
+    under a HIP engine answers to CUDA_VISIBLE_DEVICES, and "cuda_device" then numbers that family's cards (as nvidia-smi does), so the
+    encoder can sit on a card of another make while the engine keeps driving its own (#408's one-make case is unchanged).  Without either, nothing changes."""
     vision = cfg.get("vision") or {}
     dev = vision.get("cuda_device")
-    if dev is None and cfg.get("backend") == "hip":
-        dev = vision_card_off_igpu(env, archs)
     own = vision.get("env") or {}
+    # which family the reader program belongs to: the package its path sits in marks it (the same fact "Vision.visible_cards" reads
+    # off the program), so a reader of ANOTHER make - the CUDA encoder beside a HIP engine, an AMD card running the model and an
+    # NVIDIA card reading the picture - gets its own card variable rather than the engine's.  A name that marks no package (a plain
+    # name, a file of one's own) is the engine's own family, as before.
+    reader = engine_component.package_make(Path(str(vision.get("exe") or "")).parent)
+    hip_side = reader == "hip" if reader else cfg.get("backend") == "hip"
+    if dev is None and hip_side:
+        dev = vision_card_off_igpu(env, archs)
     if dev is None and not own:
         return env
     env = dict(env)
     if dev is not None:
-        if cfg.get("backend") == "hip":
+        if hip_side:
             env["HIP_VISIBLE_DEVICES"] = str(dev)
         else:
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"

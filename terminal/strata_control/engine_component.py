@@ -497,6 +497,17 @@ def clean_backend_name(value) -> str:
     return name if name in ("cuda", "hip", "sycl") else ""
 
 
+def package_make(folder) -> str | None:
+    """The engine family an installed package folder marks in its own name: the release feed labels a package "0.1.59-windows-x86_64-hip-rx9070"
+    (the AMD one) or "0.1.59-windows-x86_64-cuda-cuda13" (the NVIDIA one), so a program that sits in such a folder says which make of card
+    it runs on.  None when the name marks none (a source build's folder, a file of one's own)."""
+    for token in str(folder or "").lower().replace("_", "-").split("-"):
+        for make in ("hip", "cuda", "sycl"):
+            if token == make or token.startswith(make):
+                return make
+    return None
+
+
 def saved_backend(environ=None) -> str | None:
     """The engine family the person chose with `strata launch --backend` (kept in the settings file), or None. It is ignored when this PC
     has no card of that make (the choice was made on other hardware): the PC's own detection then decides again."""

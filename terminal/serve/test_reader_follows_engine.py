@@ -48,6 +48,24 @@ class ReaderFollowsEngine(unittest.TestCase):
             fixed = server.with_current_reader(cfg, engine / "0.1.54-x")
             self.assertEqual(fixed["vision"]["exe"], str(engine / "0.1.54-x" / "strata-vision.exe"))
 
+    def test_a_reader_of_another_make_that_names_its_card_stays(self):
+        # the encoder on a card of the OTHER make (an AMD engine in use, the CUDA package's reader beside it): the section names
+        # a card, so the path is a choice and not the engine's reader from before an update
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self.make(Path(tmp), "0.1.59-windows-x86_64-hip-rx9070", "0.1.59-windows-x86_64-cuda-cuda13")
+            cfg = {"backend": "hip", "vision": {"exe": str(engine / "0.1.59-windows-x86_64-cuda-cuda13" / "strata-vision.exe"),
+                                                "gpu": True, "cuda_device": 0}}
+            self.assertIs(server.with_current_reader(cfg, engine / "0.1.59-windows-x86_64-hip-rx9070"), cfg)
+
+    def test_a_reader_of_the_same_make_from_an_older_package_still_moves(self):
+        # the #4658 case, with the packages named the way the feed labels them: same family, so the repair still runs
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self.make(Path(tmp), "0.1.52-windows-x86_64-hip-rx9070", "0.1.59-windows-x86_64-hip-rx9070")
+            cfg = {"backend": "hip", "vision": {"exe": str(engine / "0.1.52-windows-x86_64-hip-rx9070" / "strata-vision.exe"),
+                                                "gpu": True, "cuda_device": 1}}
+            fixed = server.with_current_reader(cfg, engine / "0.1.59-windows-x86_64-hip-rx9070")
+            self.assertEqual(fixed["vision"]["exe"], str(engine / "0.1.59-windows-x86_64-hip-rx9070" / "strata-vision.exe"))
+
 
 if __name__ == "__main__":
     unittest.main()

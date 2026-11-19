@@ -1983,6 +1983,24 @@ class GpuChoice(unittest.TestCase):
         plain = {"gpu": [0, 1], "vision": {"exe": "v"}}
         self.assertIs(vision_env(plain, env), env)          # no cuda_device: the engine's environment, unchanged
 
+    def test_vision_reader_of_another_make(self):
+        # the encoder of the OTHER make beside the engine's cards (an AMD engine, a CUDA reader on an NVIDIA card): the package the
+        # reader sits in marks its make, so the section names that make's card and the engine's variable stays as it was
+        from serve.server import child_env, vision_env
+        cfg = {"backend": "hip", "gpu": [0], "vision": {"exe": os.sep + os.sep.join(
+                                                ("components", "engine", "0.1.59-windows-x86_64-cuda-cuda13", "strata-vision.exe")),
+                                         "gpu": True, "cuda_device": 0}}
+        env = child_env(cfg)
+        self.assertEqual(env["HIP_VISIBLE_DEVICES"], "0")
+        reader = vision_env(cfg, env)
+        self.assertEqual(reader.get("CUDA_VISIBLE_DEVICES"), "0")      # the CUDA reader answers to CUDA's variable
+        self.assertEqual(reader.get("CUDA_DEVICE_ORDER"), "PCI_BUS_ID")
+        self.assertEqual(reader["HIP_VISIBLE_DEVICES"], "0")           # and the engine keeps its own card
+        amd = {"backend": "hip", "gpu": [0], "vision": {"exe": os.sep + os.sep.join(
+                                            ("components", "engine", "0.1.59-windows-x86_64-hip-rx9070", "strata-vision-hip.exe")),
+                                            "gpu": True, "cuda_device": 1}}
+        self.assertEqual(vision_env(amd, child_env(amd))["HIP_VISIBLE_DEVICES"], "1")   # the shipped key, unchanged, for a reader of the engine's make
+
     def test_hip_ordinal(self):
         """#325: on Windows the HIP ordinal setup resolved wins over the config's "gpu" (an iGPU takes HIP's 0)."""
         from unittest import mock
